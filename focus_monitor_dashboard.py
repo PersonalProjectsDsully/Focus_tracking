@@ -9,10 +9,49 @@ import os
 from pathlib import Path
 from datetime import datetime
 import time
+import subprocess
+import sys
+import psutil
 
 # --- Configuration ---
 LOGS_DIR = Path(__file__).parent / "focus_logs"
 LABELS_FILE = LOGS_DIR / "activity_labels.json"
+
+# --- Tracker Control Functions ---
+def is_tracker_running():
+    pid = st.session_state.get("tracker_pid")
+    if pid is None:
+        return False
+    return psutil.pid_exists(pid)
+
+
+def start_tracker():
+    """Launch the focus monitor as a background process."""
+    if is_tracker_running():
+        st.info("Focus tracker already running.")
+        return
+    script = str(Path(__file__).parent / "standalone_focus_monitor.py")
+    process = subprocess.Popen([sys.executable, script])
+    st.session_state["tracker_pid"] = process.pid
+    st.success("Focus tracker started")
+
+
+def stop_tracker():
+    """Terminate the running focus monitor process."""
+    pid = st.session_state.get("tracker_pid")
+    if not pid or not psutil.pid_exists(pid):
+        st.info("Focus tracker is not running.")
+        st.session_state["tracker_pid"] = None
+        return
+    try:
+        p = psutil.Process(pid)
+        p.terminate()
+        p.wait(timeout=5)
+        st.success("Focus tracker stopped")
+    except Exception as e:
+        st.error(f"Failed to stop tracker: {e}")
+    finally:
+        st.session_state["tracker_pid"] = None
 
 # --- Data Management Functions ---
 def load_available_dates():
@@ -359,7 +398,7 @@ def check_for_chart_image(date_str):
 
 # --- Label Editor Page ---
 def display_label_editor():
-    st.title("🏷️ Activity Labeling")
+    st.title("🏷 Label Editor")
     
     # Select date for labeling
     available_dates = load_available_dates()
@@ -1032,13 +1071,24 @@ def display_dashboard():
 def main():
     # Set page configuration
     st.set_page_config(
-        page_title="Focus Monitor Dashboard", 
+        page_title="Focus Monitor Dashboard",
         layout="wide",
         initial_sidebar_state="expanded"
     )
+
+    # Sidebar controls to manage the tracker
+    st.sidebar.header("Focus Tracker")
+    if is_tracker_running():
+        if st.sidebar.button("Stop Tracker"):
+            stop_tracker()
+        st.sidebar.success("Tracker running")
+    else:
+        if st.sidebar.button("Start Tracker"):
+            start_tracker()
+        st.sidebar.info("Tracker stopped")
     
     # Create tabs for Dashboard and Label Editor
-    tab1, tab2 = st.tabs(["📊 Dashboard", "🏷️ Labeling"])
+    tab1, tab2 = st.tabs(["📊 Dashboard", "🏷 Label Editor"])
     
     with tab1:
         display_dashboard()
