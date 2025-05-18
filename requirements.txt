@@ -1,0 +1,7 @@
+streamlit
+pandas
+matplotlib
+plotly
+pywin32
+requests
+wmi
