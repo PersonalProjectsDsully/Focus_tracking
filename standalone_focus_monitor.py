@@ -484,49 +484,6 @@ class FocusMonitorAgent:
             logger.error(f"Error generating daily summary file for {date_str}: {e}", exc_info=True)
             return None
 
-    def _generate_usage_chart(self, summary, date_str):
-        """Generate a pie chart of application usage."""
-        try:
-            import matplotlib.pyplot as plt
-            
-            # Ensure there's app data to visualize
-            if not summary or not summary.get("appBreakdown"):
-                logger.warning("No app data available for chart")
-                return
-                
-            # Get the top 8 apps by time spent, group others
-            app_data = summary["appBreakdown"]
-            if len(app_data) > 10:
-                top_apps = app_data[:10]
-                other_time = sum(app["timeSpent"] for app in app_data[10:])
-                if other_time > 0:
-                    top_apps.append({
-                        "appName": "Other Apps",
-                        "timeSpent": other_time,
-                        "percentage": sum(app["percentage"] for app in app_data[10:])
-                    })
-            else:
-                top_apps = app_data
-                
-            # Create the chart
-            labels = [f"{app['appName']} ({app['timeSpent']//60}m)" for app in top_apps]
-            sizes = [app["timeSpent"] for app in top_apps]
-            
-            plt.figure(figsize=(12, 9))
-            plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
-            plt.axis('equal')
-            plt.title(f"App Usage - {date_str}")
-            
-            # Save the chart
-            chart_file = self.focus_logs_dir / f"usage_chart_{date_str}.png"
-            plt.savefig(chart_file, dpi=100, bbox_inches='tight')
-            plt.close()
-            logger.info(f"Generated usage chart at {chart_file}")
-        except ImportError:
-            logger.warning("Matplotlib not installed - cannot generate chart. Install with: pip install matplotlib")
-        except Exception as e:
-            logger.error(f"Error creating chart: {e}")
-
     # --- Keep calculation helpers needed by _generate_daily_summary ---
     def _calculate_focus_score(self, productive_apps: List[str], distraction_apps: List[str], app_breakdown: List[Dict], total_time: int) -> int:
         if total_time <= 0: return 0
