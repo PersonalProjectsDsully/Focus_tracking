@@ -5,3 +5,4 @@ plotly
 pywin32
 requests
 wmi
+psutil
