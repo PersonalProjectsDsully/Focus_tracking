@@ -1,2 +1,3 @@
-focus_logs
+focus_logs/*
+!focus_logs/block_feedback.json
 focus_monitor.log
