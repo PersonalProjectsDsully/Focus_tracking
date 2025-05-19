@@ -6,3 +6,5 @@ pywin32
 requests
 wmi
 psutil
+pillow
+pytesseract
