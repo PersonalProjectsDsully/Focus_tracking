@@ -85,6 +85,14 @@ class FocusMonitorAgent:
         self.last_summary_time: float = 0
         self.summary_interval: int = 300  # Generate summary every 5 minutes
 
+        # Session start timestamp for 5-minute buckets
+        self.session_start_time: float = time.time()
+        self.session_start_tag: str = (
+            datetime.datetime.utcfromtimestamp(self.session_start_time)
+            .strftime("%Y%m%dT%H%M%SZ")
+        )
+        self.time_buckets: Dict[int, Dict[str, Set[str]]] = {}
+
         # Create focus_logs directory within the script or specified directory
         self.focus_logs_dir = self.output_dir / "focus_logs"
         self.focus_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -343,13 +351,67 @@ class FocusMonitorAgent:
             }
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
-                
+
             # Log with profile info if available
             title_snip = log_entry['title'][:60].replace('\n', ' ') + ('...' if len(log_entry['title']) > 60 else '')
             profile_info = f" ({log_entry['app_profile']})" if log_entry.get('app_profile') else ""
             logger.info(f"Logged: {app_identity}{profile_info} - '{title_snip}' ({duration}s)")
+
+            # Update in-memory 5-minute bucket summary
+            self._update_time_bucket(log_entry)
         except Exception as e:
             logger.error(f"Error writing to log file {log_file}: {e}")
+
+    def _update_time_bucket(self, log_entry: Dict):
+        """Update the in-memory 5-minute bucket summary with a new log entry."""
+        try:
+            ts = datetime.datetime.fromisoformat(log_entry["timestamp"]).timestamp()
+        except Exception:
+            ts = time.time()
+
+        bucket_index = int((ts - self.session_start_time) // 300)
+        bucket_start = self.session_start_time + bucket_index * 300
+        bucket_end = bucket_start + 300
+
+        bucket = self.time_buckets.setdefault(
+            bucket_index,
+            {
+                "start": datetime.datetime.utcfromtimestamp(bucket_start).isoformat(),
+                "end": datetime.datetime.utcfromtimestamp(bucket_end).isoformat(),
+                "apps": set(),
+                "titles": set(),
+                "ocr_text": set(),
+            },
+        )
+
+        bucket["apps"].add(log_entry.get("app_name", "Unknown"))
+        if log_entry.get("title"):
+            bucket["titles"].add(log_entry["title"])
+        if log_entry.get("ocr_text"):
+            bucket["ocr_text"].add(log_entry["ocr_text"])
+
+    def _write_time_bucket_summary(self):
+        """Write the current time bucket summary to a JSON file."""
+        bucket_file = self.focus_logs_dir / f"time_buckets_{self.session_start_tag}.json"
+        serializable = []
+        for idx in sorted(self.time_buckets.keys()):
+            b = self.time_buckets[idx]
+            serializable.append(
+                {
+                    "start": b["start"],
+                    "end": b["end"],
+                    "apps": sorted(b["apps"]),
+                    "titles": sorted(b["titles"]),
+                    "ocr_text": sorted(b["ocr_text"]),
+                }
+            )
+
+        try:
+            with open(bucket_file, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, indent=2)
+            logger.info(f"Wrote time bucket summary to {bucket_file}")
+        except Exception as e:
+            logger.error(f"Error writing bucket summary: {e}")
 
     def _generate_daily_summary(self, date_str=None):
         """Generate a daily summary for the specified date or today."""
@@ -529,6 +591,7 @@ class FocusMonitorAgent:
                     time_since_last_summary = time.time() - self.last_summary_time
                     if time_since_last_summary >= self.summary_interval:
                         self._generate_daily_summary()
+                        self._write_time_bucket_summary()
                         self.last_summary_time = time.time()
                         
                     await asyncio.sleep(max(0.1, interval - (time.time() - main_loop_start_time)))
@@ -539,6 +602,7 @@ class FocusMonitorAgent:
                 if current_day_utc != self.today:
                     logger.info(f"Date changed from {self.today} to {current_day_utc}. Generating previous day summary.")
                     self._generate_daily_summary(self.today) # Generate final summary for previous day
+                    self._write_time_bucket_summary()
                     self.today = current_day_utc
                     logger.info(f"Updated current tracking date to {self.today}")
                 
@@ -569,6 +633,7 @@ class FocusMonitorAgent:
                 time_since_last_summary = time.time() - self.last_summary_time
                 if time_since_last_summary >= self.summary_interval:
                     self._generate_daily_summary()
+                    self._write_time_bucket_summary()
                     self.last_summary_time = time.time()
 
                 # Sleep until next interval
@@ -589,6 +654,7 @@ class FocusMonitorAgent:
             duration = int(time.time() - self.window_start_time)
             if duration > 0: self._log_window_activity(self.last_window_info, duration)
         self._generate_daily_summary() # Generate final summary for the last active day
+        self._write_time_bucket_summary()
         logger.info("Focus Monitor agent stopped.")
 
 
@@ -619,6 +685,7 @@ async def main_async():
     # Generate a summary immediately if requested
     if args.force_summary:
         agent._generate_daily_summary()
+        agent._write_time_bucket_summary()
         agent.last_summary_time = time.time()
 
     tasks = [asyncio.create_task(agent.run_agent_loop(args.interval))]
@@ -636,6 +703,9 @@ async def main_async():
 
 
 if __name__ == "__main__":
-     try: asyncio.run(main_async())
-     except KeyboardInterrupt: logger.info("Focus Monitor stopped by user (main).")
-     except Exception as main_err: logger.critical(f"Focus Monitor exited: {main_err}", exc_info=True)
+     try:
+         asyncio.run(main_async())
+     except KeyboardInterrupt:
+         logger.info("Focus Monitor stopped by user (main).")
+     except Exception as main_err:
+         logger.critical(f"Focus Monitor exited: {main_err}", exc_info=True)
