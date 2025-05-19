@@ -18,7 +18,7 @@ import logging
 import argparse
 import datetime
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any
 from pathlib import Path
 import asyncio
 from PIL import ImageGrab
@@ -95,7 +95,7 @@ class FocusMonitorAgent:
             datetime.datetime.utcfromtimestamp(self.session_start_time)
             .strftime("%Y%m%dT%H%M%SZ")
         )
-        self.time_buckets: Dict[int, Dict[str, Set[str]]] = {}
+        self.time_buckets: Dict[int, Dict[str, Any]] = {}
 
         # Create focus_logs directory within the script or specified directory
         self.focus_logs_dir = self.output_dir / "focus_logs"
@@ -435,6 +435,7 @@ class FocusMonitorAgent:
                 "apps": set(),
                 "titles": set(),
                 "ocr_text": set(),
+                "summary": "",
             },
         )
 
@@ -443,6 +444,29 @@ class FocusMonitorAgent:
             bucket["titles"].add(log_entry["title"])
         if log_entry.get("ocr_text"):
             bucket["ocr_text"].add(log_entry["ocr_text"])
+
+        self._generate_bucket_summary(bucket)
+
+    def _generate_bucket_summary(self, bucket: Dict):
+        """Summarize a time bucket using Ollama and store the result."""
+        try:
+            text_parts = list(bucket.get("titles", set())) + list(bucket.get("ocr_text", set()))
+            if not text_parts:
+                bucket["summary"] = ""
+                return
+
+            prompt = "Summarize the following activity:\n" + "\n".join(text_parts)
+            resp = requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": "llama3", "prompt": prompt, "stream": False},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            bucket["summary"] = data.get("response", "").strip()
+        except Exception as e:
+            logger.error(f"Error generating bucket summary: {e}")
+            bucket.setdefault("summary", "")
 
     def _write_time_bucket_summary(self):
         """Write the current time bucket summary to a JSON file."""
@@ -457,6 +481,7 @@ class FocusMonitorAgent:
                     "apps": sorted(b["apps"]),
                     "titles": sorted(b["titles"]),
                     "ocr_text": sorted(b["ocr_text"]),
+                    "summary": b.get("summary", ""),
                 }
             )
 
