@@ -15,6 +15,7 @@ import psutil
 # --- Configuration ---
 LOGS_DIR = Path(__file__).parent / "focus_logs"
 LABELS_FILE = LOGS_DIR / "activity_labels.json"
+FEEDBACK_FILE = LOGS_DIR / "block_feedback.json"
 
 # --- Tracker Control Functions ---
 def is_tracker_running():
@@ -289,6 +290,47 @@ def group_activities_for_labeling(logs_df):
     
     # Sort by duration
     return grouped.sort_values('duration', ascending=False)
+
+# --- Feedback Management Functions ---
+def load_block_feedback():
+    """Load saved feedback for time blocks"""
+    if not FEEDBACK_FILE.exists():
+        return {}
+    try:
+        with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading feedback: {e}")
+        return {}
+
+
+def save_block_feedback(feedback):
+    """Save feedback mapping to file"""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
+            json.dump(feedback, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error saving feedback: {e}")
+        return False
+
+
+def load_time_buckets(date_str):
+    """Load 5-minute time bucket summaries for a given date"""
+    buckets = []
+    for path in LOGS_DIR.glob('time_buckets_*.json'):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for b in data:
+                    start = b.get('start', '')
+                    if start.split('T')[0] == date_str:
+                        buckets.append(b)
+        except Exception:
+            continue
+    buckets.sort(key=lambda x: x.get('start'))
+    return buckets
 
 # --- Visualization Functions ---
 def create_pie_chart(app_data):
@@ -1051,6 +1093,38 @@ def display_dashboard():
             st.dataframe(display_df, use_container_width=True)
         else:
             st.info("No log entries available for this date.")
+
+    # --- Block Feedback Section ---
+    buckets = load_time_buckets(selected_date)
+    if buckets:
+        st.subheader("📝 Add Feedback for 5-Minute Blocks")
+        option_map = {b['start']: f"{b['start'][11:16]} UTC" for b in buckets}
+        selected_blocks = st.multiselect(
+            "Select block start times",
+            options=list(option_map.keys()),
+            format_func=lambda x: option_map[x]
+        )
+        feedback_text = st.text_area("Feedback")
+        if st.button("Submit Feedback"):
+            if selected_blocks and feedback_text.strip():
+                feedback = load_block_feedback()
+                for ts in selected_blocks:
+                    feedback[ts] = feedback_text.strip()
+                if save_block_feedback(feedback):
+                    st.success("Feedback saved")
+                    time.sleep(1)
+                    st.rerun()
+            else:
+                st.warning("Select block(s) and enter feedback text")
+        existing = load_block_feedback()
+        if existing:
+            st.markdown("#### Existing Feedback")
+            feedback_rows = [
+                {"Block Start": k, "Feedback": v}
+                for k, v in existing.items() if k in option_map
+            ]
+            if feedback_rows:
+                st.dataframe(pd.DataFrame(feedback_rows), use_container_width=True)
     
     # --- Additional Info ---
     st.markdown("---")
