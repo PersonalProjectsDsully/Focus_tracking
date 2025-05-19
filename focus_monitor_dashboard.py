@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import re
 import os
+import requests
 from pathlib import Path
 from datetime import datetime
 import time
@@ -476,6 +477,27 @@ def save_feedback(feedback):
         st.error(f"Error saving feedback: {e}")
         return False
 
+def generate_llm_update(summary_text, user_text):
+    """Use a local LLM to suggest an updated summary."""
+    prompt = (
+        "Refine the following time summary using the user's notes.\n\n"
+        f"Summary:\n{summary_text}\n\n"
+        f"User notes:\n{user_text}\n\n"
+        "Updated summary:"
+    )
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "llama3", "prompt": prompt, "stream": False},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response", "").strip()
+    except Exception as e:
+        st.error(f"LLM error: {e}")
+        return user_text
+
 def display_time_bucket_summaries():
     """Display 5-minute summaries with editable feedback fields."""
     st.title("📝 5-Minute Summaries")
@@ -503,12 +525,15 @@ def display_time_bucket_summaries():
         with st.expander(f"{start} - {end}"):
             st.write(summary or "_No summary available_")
             text = st.text_area("Feedback", value=existing_fb, key=f"fb_{idx}")
-            cols = st.columns(2)
-            if cols[0].button("Save", key=f"save_{idx}"):
-                feedback[key] = text.strip()
+            cols = st.columns(3)
+            if cols[0].button("LLM Suggest", key=f"llm_{idx}"):
+                new_text = generate_llm_update(summary, text)
+                st.session_state[f"fb_{idx}"] = new_text
+            if cols[1].button("Save", key=f"save_{idx}"):
+                feedback[key] = st.session_state.get(f"fb_{idx}", "").strip()
                 save_feedback(feedback)
                 st.success("Saved feedback")
-            if cols[1].button("Delete", key=f"delete_{idx}"):
+            if cols[2].button("Delete", key=f"delete_{idx}"):
                 if key in feedback:
                     del feedback[key]
                     save_feedback(feedback)
