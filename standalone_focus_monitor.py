@@ -3,7 +3,8 @@
 Focus Monitor Agent (Window Title Tracking Version)
 
 This script tracks the title and executable of the currently focused window
-to generate focus activity logs and daily summaries. Does NOT take screenshots.
+to generate focus activity logs and daily summaries. It can capture screenshots
+for certain applications and perform OCR on the images.
 Runs completely standalone and saves all files to the script's directory.
 Generates live summaries for the current day's activity.
 Detects and groups browser profiles for Microsoft Edge.
@@ -20,6 +21,8 @@ import re
 from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
 import asyncio
+from PIL import ImageGrab
+import pytesseract
 
 try:
     import win32gui
@@ -65,6 +68,7 @@ DISTRACTION_TITLE_KEYWORDS = {"youtube", "facebook", "twitter", "reddit", "netfl
 MEETING_EXES = {"teams.exe", "zoom.exe", "webex", "skype.exe", "slack.exe"}
 MEETING_TITLE_KEYWORDS = {"meet", "meeting", "call", "webinar", "huddle",
                            "zoom meeting", "microsoft teams meeting", "google meet"}
+OCR_APPS = {"notepad.exe", "word.exe", "acrord32.exe"}
 
 # --- Browser Profile Detection Patterns ---
 EDGE_PROFILE_PATTERN = re.compile(r'Microsoft Edge(?:\s*-\s*(.+))?$')
@@ -96,6 +100,10 @@ class FocusMonitorAgent:
         # Create focus_logs directory within the script or specified directory
         self.focus_logs_dir = self.output_dir / "focus_logs"
         self.focus_logs_dir.mkdir(parents=True, exist_ok=True)
+        self.screenshot_dir = self.focus_logs_dir / "screenshots"
+        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self.ocr_last_times: Dict[int, float] = {}
+        self.ocr_results: Dict[int, Dict[str, str]] = {}
 
         logger.info(f"Initialized FocusMonitorAgent (Window Tracking). Output: {self.focus_logs_dir}, API: {self.api_url or 'Disabled'}")
 
@@ -316,11 +324,32 @@ class FocusMonitorAgent:
 
             # Extract profile info if available - pass PID for Chrome profile detection
             profile = self._extract_browser_profile(exe, title, pid)
-            
+
+            ocr_text = None
+            screenshot_path = None
+            exe_lower = os.path.basename(exe).lower()
+            if exe_lower in OCR_APPS:
+                last_time = self.ocr_last_times.get(hwnd, 0)
+                if time.time() - last_time >= 10:
+                    try:
+                        image = ImageGrab.grab()
+                        screenshot_path = self.screenshot_dir / f"{int(time.time())}_{hwnd}.png"
+                        image.save(screenshot_path)
+                        ocr_text = pytesseract.image_to_string(image)
+                        self.ocr_last_times[hwnd] = time.time()
+                        self.ocr_results[hwnd] = {"text": ocr_text, "path": str(screenshot_path)}
+                    except Exception as e:
+                        logger.error(f"OCR capture failed: {e}")
+
             return {
-                "hwnd": hwnd, "pid": pid, "exe": exe, "title": title,
-                "app_profile": profile,  # Store profile info
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                "hwnd": hwnd,
+                "pid": pid,
+                "exe": exe,
+                "title": title,
+                "app_profile": profile,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "ocr_text": ocr_text,
+                "screenshot_path": str(screenshot_path) if screenshot_path else None,
             }
         except Exception as e:
             if "pywintypes.error" in str(type(e)) and e.args[0] in [0, 1400]: # Handle window closing during check
@@ -340,43 +369,52 @@ class FocusMonitorAgent:
         if duration <= 0:
             return
         try:
-            # Make sure focus_logs directory exists
             self.focus_logs_dir.mkdir(parents=True, exist_ok=True)
             log_file = self.focus_logs_dir / f"focus_log_{self.today}.jsonl"
-            
-            # Include app_identity and profile in the log
+
             app_identity, exe_path = self._get_app_identity(window_info["exe"], window_info["title"])
-            
+
             log_entry = {
                 "timestamp": window_info["timestamp"],
                 "exe": window_info["exe"],
-                "app_name": app_identity,  # Include friendly app name with profile
-                "app_profile": window_info.get("app_profile"),  # Include profile if available
+                "app_name": app_identity,
+                "app_profile": window_info.get("app_profile"),
                 "title": window_info["title"],
                 "duration": duration,
-                "pid": window_info.get("pid", 0)  # Include PID for potential label lookup
+                "pid": window_info.get("pid", 0)
             }
 
-            # Optional OCR / screenshot metadata
-            ocr_val = ocr_text if ocr_text is not None else window_info.get("ocr_text")
-            if ocr_val:
-                log_entry["ocr_text"] = ocr_val
+            # Handle OCR info
+            hwnd = window_info.get("hwnd")
+            ocr_info = self.ocr_results.pop(hwnd, None) if hwnd else None
+            if ocr_info:
+                log_entry["ocr_text"] = ocr_info.get("text")
+                log_entry["screenshot_path"] = ocr_info.get("path")
+            else:
+                if ocr_text:
+                    log_entry["ocr_text"] = ocr_text
+                if screenshot_path:
+                    log_entry["screenshot_path"] = screenshot_path
+                else:
+                    if window_info.get("ocr_text"):
+                        log_entry["ocr_text"] = window_info["ocr_text"]
+                    if window_info.get("screenshot_path"):
+                        log_entry["screenshot_path"] = window_info["screenshot_path"]
 
-            screenshot_val = screenshot_path if screenshot_path is not None else window_info.get("screenshot_path")
-            if screenshot_val:
-                log_entry["screenshot_path"] = screenshot_val
+            if hwnd in self.ocr_last_times:
+                self.ocr_last_times.pop(hwnd, None)
+
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
 
-            # Log with profile info if available
             title_snip = log_entry['title'][:60].replace('\n', ' ') + ('...' if len(log_entry['title']) > 60 else '')
             profile_info = f" ({log_entry['app_profile']})" if log_entry.get('app_profile') else ""
             logger.info(f"Logged: {app_identity}{profile_info} - '{title_snip}' ({duration}s)")
 
-            # Update in-memory 5-minute bucket summary
             self._update_time_bucket(log_entry)
         except Exception as e:
             logger.error(f"Error writing to log file {log_file}: {e}")
+
 
     def _update_time_bucket(self, log_entry: Dict):
         """Update the in-memory 5-minute bucket summary with a new log entry."""
