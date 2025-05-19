@@ -17,6 +17,7 @@ LOGS_DIR = Path(__file__).parent / "focus_logs"
 LABELS_FILE = LOGS_DIR / "activity_labels.json"
 FEEDBACK_FILE = LOGS_DIR / "block_feedback.json"
 
+
 # --- Tracker Control Functions ---
 def is_tracker_running():
     pid = st.session_state.get("tracker_pid")
@@ -436,6 +437,82 @@ def check_for_chart_image(date_str):
     """Check if a pre-generated chart image exists"""
     chart_path = LOGS_DIR / f"usage_chart_{date_str}.png"
     return chart_path if chart_path.exists() else None
+
+# --- Time Bucket Summary Functions ---
+def load_time_buckets_for_date(date_str):
+    """Load all 5-minute buckets for the specified date."""
+    buckets = []
+    for path in LOGS_DIR.glob("time_buckets_*.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for b in data:
+                if b.get("start", "")[:10] == date_str:
+                    buckets.append(b)
+        except Exception as e:
+            st.error(f"Error reading {path}: {e}")
+    buckets.sort(key=lambda x: x.get("start", ""))
+    return buckets
+
+def load_feedback():
+    """Load saved feedback for time buckets."""
+    if not FEEDBACK_FILE.exists():
+        return {}
+    try:
+        with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading feedback: {e}")
+        return {}
+
+def save_feedback(feedback):
+    """Save feedback dictionary to file."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(FEEDBACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(feedback, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error saving feedback: {e}")
+        return False
+
+def display_time_bucket_summaries():
+    """Display 5-minute summaries with editable feedback fields."""
+    st.title("📝 5-Minute Summaries")
+
+    dates = load_available_dates()
+    if not dates:
+        st.error("No data found in focus_logs directory.")
+        st.stop()
+
+    selected_date = st.selectbox("Select a date", dates)
+
+    buckets = load_time_buckets_for_date(selected_date)
+    feedback = load_feedback()
+
+    if not buckets:
+        st.info(f"No 5-minute summaries found for {selected_date}.")
+        return
+
+    for idx, bucket in enumerate(buckets):
+        start = pd.to_datetime(bucket["start"]).strftime("%H:%M")
+        end = pd.to_datetime(bucket["end"]).strftime("%H:%M")
+        summary = bucket.get("summary", "")
+        key = bucket["start"]
+        existing_fb = feedback.get(key, "")
+        with st.expander(f"{start} - {end}"):
+            st.write(summary or "_No summary available_")
+            text = st.text_area("Feedback", value=existing_fb, key=f"fb_{idx}")
+            cols = st.columns(2)
+            if cols[0].button("Save", key=f"save_{idx}"):
+                feedback[key] = text.strip()
+                save_feedback(feedback)
+                st.success("Saved feedback")
+            if cols[1].button("Delete", key=f"delete_{idx}"):
+                if key in feedback:
+                    del feedback[key]
+                    save_feedback(feedback)
+                    st.success("Deleted feedback")
 
 # --- Label Editor Page ---
 def display_label_editor():
@@ -1152,14 +1229,17 @@ def main():
     # Removed sidebar tracker controls. Manually run the tracker using
     # `python standalone_focus_monitor.py` before launching the dashboard.
     
-    # Create tabs for Dashboard and Label Editor
-    tab1, tab2 = st.tabs(["📊 Dashboard", "🏷 Label Editor"])
-    
+    # Create tabs for Dashboard, Label Editor and 5-Minute Summaries
+    tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🏷 Label Editor", "📝 Summaries"])
+
     with tab1:
         display_dashboard()
-        
+
     with tab2:
         display_label_editor()
+
+    with tab3:
+        display_time_bucket_summaries()
 
 if __name__ == "__main__":
     main()
