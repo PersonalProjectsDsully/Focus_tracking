@@ -1076,16 +1076,8 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    # Sidebar controls to manage the tracker
-    st.sidebar.header("Focus Tracker")
-    if is_tracker_running():
-        if st.sidebar.button("Stop Tracker"):
-            stop_tracker()
-        st.sidebar.success("Tracker running")
-    else:
-        if st.sidebar.button("Start Tracker"):
-            start_tracker()
-        st.sidebar.info("Tracker stopped")
+    # Removed sidebar tracker controls. Manually run the tracker using
+    # `python standalone_focus_monitor.py` before launching the dashboard.
     
     # Create tabs for Dashboard and Label Editor
     tab1, tab2 = st.tabs(["📊 Dashboard", "🏷 Label Editor"])
