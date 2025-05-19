@@ -321,9 +321,16 @@ class FocusMonitorAgent:
             logger.error(f"Error getting focused window details: {e}", exc_info=False)
             return None
 
-    def _log_window_activity(self, window_info: Dict, duration: int):
-        """Log focused window activity to JSONL file."""
-        if duration <= 0: return
+    def _log_window_activity(self, window_info: Dict, duration: int, ocr_text: Optional[str] = None, screenshot_path: Optional[str] = None):
+        """Log focused window activity to JSONL file.
+
+        Additional fields such as OCR text or screenshot path can be provided
+        either via the optional parameters or within ``window_info`` itself.
+        These fields are only written when present so older logs remain
+        compatible.
+        """
+        if duration <= 0:
+            return
         try:
             # Make sure focus_logs directory exists
             self.focus_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -333,14 +340,23 @@ class FocusMonitorAgent:
             app_identity, exe_path = self._get_app_identity(window_info["exe"], window_info["title"])
             
             log_entry = {
-                "timestamp": window_info["timestamp"], 
+                "timestamp": window_info["timestamp"],
                 "exe": window_info["exe"],
                 "app_name": app_identity,  # Include friendly app name with profile
                 "app_profile": window_info.get("app_profile"),  # Include profile if available
-                "title": window_info["title"], 
+                "title": window_info["title"],
                 "duration": duration,
                 "pid": window_info.get("pid", 0)  # Include PID for potential label lookup
             }
+
+            # Optional OCR / screenshot metadata
+            ocr_val = ocr_text if ocr_text is not None else window_info.get("ocr_text")
+            if ocr_val:
+                log_entry["ocr_text"] = ocr_val
+
+            screenshot_val = screenshot_path if screenshot_path is not None else window_info.get("screenshot_path")
+            if screenshot_val:
+                log_entry["screenshot_path"] = screenshot_val
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
                 
@@ -375,6 +391,8 @@ class FocusMonitorAgent:
             app_time: Dict[str, float] = {}  # Now keyed by app_name (includes profile)
             app_titles: Dict[str, Set[str]] = {}
             app_exes: Dict[str, str] = {}  # Map app_name to exe for classification
+            app_ocr_texts: Dict[str, Set[str]] = {}
+            app_screens: Dict[str, Set[str]] = {}
             
             # --- Process Log File ---
             with open(log_file, "r", encoding="utf-8") as f:
@@ -402,14 +420,24 @@ class FocusMonitorAgent:
                         
                         # Track time by app_name (with profile)
                         app_time[app_name] = app_time.get(app_name, 0) + duration
-                        
+
                         # Track titles for each app_name
-                        if app_name not in app_titles: 
+                        if app_name not in app_titles:
                             app_titles[app_name] = set()
                             app_exes[app_name] = exe  # Store exe for classification
-                        
-                        if len(app_titles[app_name]) < 50: 
+                            app_ocr_texts[app_name] = set()
+                            app_screens[app_name] = set()
+
+                        if len(app_titles[app_name]) < 50:
                             app_titles[app_name].add(title)
+
+                        ocr_val = entry.get("ocr_text")
+                        if ocr_val and len(app_ocr_texts[app_name]) < 50:
+                            app_ocr_texts[app_name].add(ocr_val)
+
+                        screen_val = entry.get("screenshot_path")
+                        if screen_val and len(app_screens[app_name]) < 50:
+                            app_screens[app_name].add(screen_val)
                     except Exception as e: 
                         logger.error(f"Err processing line {line_num}: {e}")
 
@@ -422,11 +450,13 @@ class FocusMonitorAgent:
                  exe = app_exes.get(app_name, "Unknown")
                  percentage = (time_spent / total_time * 100) if total_time > 0 else 0
                  app_breakdown_list.append({
-                     "appName": app_name,  # Now includes profile info 
+                     "appName": app_name,  # Now includes profile info
                      "exePath": exe,
                      "timeSpent": round(time_spent),
-                     "percentage": round(percentage, 2), 
-                     "windowTitles": sorted(list(app_titles.get(app_name, set())))
+                     "percentage": round(percentage, 2),
+                     "windowTitles": sorted(list(app_titles.get(app_name, set()))),
+                     "ocrTexts": sorted(list(app_ocr_texts.get(app_name, set()))),
+                     "screenshotPaths": sorted(list(app_screens.get(app_name, set())))
                  })
             app_breakdown_list.sort(key=lambda x: x["timeSpent"], reverse=True)
             summary["appBreakdown"] = app_breakdown_list
