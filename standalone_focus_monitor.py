@@ -458,7 +458,7 @@ class FocusMonitorAgent:
             prompt = "Summarize the following activity:\n" + "\n".join(text_parts)
             resp = requests.post(
                 "http://localhost:11434/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False},
+                json={"model": "llama3.1:8b", "prompt": prompt, "stream": False},
                 timeout=30,
             )
             resp.raise_for_status()

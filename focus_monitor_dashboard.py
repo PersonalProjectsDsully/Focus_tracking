@@ -11,11 +11,16 @@ import time
 import subprocess
 import sys
 import psutil
+import requests 
+from typing import Optional, Dict, Any, List
 
 # --- Configuration ---
 LOGS_DIR = Path(__file__).parent / "focus_logs"
 LABELS_FILE = LOGS_DIR / "activity_labels.json"
-FEEDBACK_FILE = LOGS_DIR / "block_feedback.json"
+FEEDBACK_FILE = LOGS_DIR / "block_feedback.json" # For personal notes
+
+LLM_API_URL = "http://localhost:11434/api/generate"  # Ollama API endpoint
+LLM_MODEL = "llama3.1:8b"  # Specify your desired model
 
 
 # --- Tracker Control Functions ---
@@ -25,20 +30,19 @@ def is_tracker_running():
         return False
     return psutil.pid_exists(pid)
 
-
 def start_tracker():
-    """Launch the focus monitor as a background process."""
     if is_tracker_running():
         st.info("Focus tracker already running.")
         return
     script = str(Path(__file__).parent / "standalone_focus_monitor.py")
-    process = subprocess.Popen([sys.executable, script])
-    st.session_state["tracker_pid"] = process.pid
-    st.success("Focus tracker started")
-
+    try:
+        process = subprocess.Popen([sys.executable, script])
+        st.session_state["tracker_pid"] = process.pid
+        st.success("Focus tracker started")
+    except Exception as e:
+        st.error(f"Failed to start tracker: {e}")
 
 def stop_tracker():
-    """Terminate the running focus monitor process."""
     pid = st.session_state.get("tracker_pid")
     if not pid or not psutil.pid_exists(pid):
         st.info("Focus tracker is not running.")
@@ -47,8 +51,10 @@ def stop_tracker():
     try:
         p = psutil.Process(pid)
         p.terminate()
-        p.wait(timeout=5)
+        p.wait(timeout=5) # Give it a moment to terminate
         st.success("Focus tracker stopped")
+    except psutil.NoSuchProcess:
+        st.info("Focus tracker process not found (already stopped?).")
     except Exception as e:
         st.error(f"Failed to stop tracker: {e}")
     finally:
@@ -56,7 +62,7 @@ def stop_tracker():
 
 # --- Data Management Functions ---
 def load_available_dates():
-    """Get all dates that have either logs or summaries"""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_dates = set([
         f.name.split("_")[-1].replace(".jsonl", "")
         for f in LOGS_DIR.glob("focus_log_*.jsonl")
@@ -65,10 +71,10 @@ def load_available_dates():
         f.name.split("_")[-1].replace(".json", "")
         for f in LOGS_DIR.glob("daily_summary_*.json")
     ])
-    return sorted(log_dates.union(summary_dates), reverse=True)
+    all_dates = sorted(list(log_dates.union(summary_dates)), reverse=True)
+    return all_dates
 
-def load_log_entries(date_str):
-    """Load raw log entries for a given date"""
+def load_log_entries(date_str: str) -> pd.DataFrame:
     file_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
     if not file_path.exists():
         return pd.DataFrame()
@@ -78,73 +84,74 @@ def load_log_entries(date_str):
             try:
                 entry = json.loads(line.strip())
                 data.append(entry)
-            except:
+            except json.JSONDecodeError:
+                # Optionally log this error
                 continue
     return pd.DataFrame(data)
 
-def load_daily_summary(date_str):
-    """Load summary if exists, or generate on-the-fly from logs"""
+def load_daily_summary(date_str: str) -> Optional[Dict[str, Any]]:
     file_path = LOGS_DIR / f"daily_summary_{date_str}.json"
     if file_path.exists():
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            st.error(f"Error decoding summary file for {date_str}. Generating from logs if possible.")
+    
+    log_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
+    if log_path.exists():
+        st.info(f"No pre-generated summary for {date_str}. Generating from raw logs...")
+        return generate_summary_from_logs(date_str)
     else:
-        # If no summary exists, try to generate one from logs
-        log_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
-        if log_path.exists():
-            st.info("No summary found for this date. Generating from raw logs...")
-            return generate_summary_from_logs(date_str)
-        else:
-            st.warning(f"No data available for {date_str}")
-            return None
+        st.warning(f"No log data available to generate summary for {date_str}")
+        return None
 
-def generate_summary_from_logs(date_str):
-    """Generate a summary on-the-fly from log files (simplified version)"""
-    # This is a simplified placeholder - in the actual implementation
-    # this would generate a complete summary like the main script does
+def generate_summary_from_logs(date_str: str) -> Optional[Dict[str, Any]]:
     logs_df = load_log_entries(date_str)
     if logs_df.empty:
         return None
         
-    # Apply labels to the logs
-    logs_df = apply_labels_to_logs(logs_df)
+    logs_df = apply_labels_to_logs(logs_df) # Apply custom labels first
     
-    # Basic summary structure
+    total_duration = logs_df.get("duration", pd.Series(dtype='float')).sum()
     summary = {
         "date": date_str,
-        "totalTime": logs_df["duration"].sum(),
+        "totalTime": total_duration,
         "appBreakdown": []
     }
+    if total_duration == 0:
+        return summary
+
+    # Ensure 'app_name' exists before grouping; default if not
+    if 'app_name' not in logs_df.columns:
+        logs_df['app_name'] = 'Unknown Application'
+    if 'exe' not in logs_df.columns:
+        logs_df['exe'] = 'unknown.exe'
+
+
+    app_groups = logs_df.groupby("app_name").agg(
+        exe_path=("exe", "first"),
+        time_spent=("duration", "sum"),
+        window_titles=("title", lambda x: list(set(str(t) for t in x if pd.notna(t)))[:50]) if 'title' in logs_df.columns else ([],)
+    ).reset_index()
     
-    # Group by app_name and create breakdown
-    app_groups = logs_df.groupby("app_name").agg({
-        "exe": "first",
-        "duration": "sum",
-        "title": lambda x: list(set(x))[:50]
-    }).reset_index()
-    
-    # Create app breakdown entries
     for _, row in app_groups.iterrows():
-        percentage = (row["duration"] / summary["totalTime"] * 100) if summary["totalTime"] > 0 else 0
+        percentage = (row["time_spent"] / total_duration * 100) if total_duration > 0 else 0
         summary["appBreakdown"].append({
             "appName": row["app_name"],
-            "exePath": row["exe"],
-            "timeSpent": int(row["duration"]),
+            "exePath": row.get("exe_path", "unknown.exe"),
+            "timeSpent": int(row["time_spent"]),
             "percentage": round(percentage, 2),
-            "windowTitles": row["title"]
+            "windowTitles": row.get("window_titles", []) if isinstance(row.get("window_titles"), list) else [str(row.get("window_titles"))]
         })
     
-    # Sort by time spent
     summary["appBreakdown"].sort(key=lambda x: x["timeSpent"], reverse=True)
-    
     return summary
 
 # --- Label Management Functions ---
-def load_labels():
-    """Load saved activity labels"""
+def load_labels() -> Dict[str, Any]:
     if not LABELS_FILE.exists():
         return {}
-    
     try:
         with open(LABELS_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -152,8 +159,7 @@ def load_labels():
         st.error(f"Error loading labels: {e}")
         return {}
 
-def save_labels(labels):
-    """Save activity labels to file"""
+def save_labels(labels: Dict[str, Any]) -> bool:
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         with open(LABELS_FILE, 'w', encoding='utf-8') as f:
@@ -163,1082 +169,640 @@ def save_labels(labels):
         st.error(f"Error saving labels: {e}")
         return False
 
-def get_app_key(exe, title_pattern=None):
-    """Create a unique key for an application or pattern"""
-    if title_pattern:
-        return f"{exe}::{title_pattern}"
-    return exe
-
-def apply_labels_to_logs(logs_df):
-    """Apply custom labels to log entries based on saved labels"""
+def apply_labels_to_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
     if logs_df.empty:
         return logs_df
     
-    # Load labels
     labels = load_labels()
-    if not labels:
-        # If no labels, just add the original_app_name column to match expected schema
-        result_df = logs_df.copy()
-        result_df['original_app_name'] = result_df['app_name']
-        return result_df
+    if not labels: # No custom labels defined
+        df_copy = logs_df.copy()
+        df_copy['original_app_name'] = df_copy.get('app_name', "Unknown Application")
+        return df_copy
     
-    # Make a copy to avoid modifying the original
     df = logs_df.copy()
     
-    # First, preserve the original app name
-    df['original_app_name'] = df['app_name']
+    # Ensure essential columns exist and handle NaN by converting to string
+    for col, default_val in [('app_name', "Unknown Application"), ('exe', "unknown.exe"), ('title', "")]:
+        if col not in df.columns:
+            df[col] = default_val
+        df[col] = df[col].fillna(default_val).astype(str)
+
+
+    df['original_app_name'] = df['app_name'] # Preserve original before modification
+    df['labeled_app_name'] = df['app_name']  # Start with current app_name, then override
     
-    # Create a new column for labeled app name
-    df['labeled_app_name'] = df['app_name']
-    
-    # Apply exact title matches first (highest priority)
-    for key, label in labels.get('exact_titles', {}).items():
+    # Apply exact titles: key is "exact::FULL_EXE_PATH::TITLE_STRING"
+    for key, label_val in labels.get('exact_titles', {}).items():
         try:
-            _, exe, title = key.split("::", 2)
-            # Find exact matches for both exe and title
-            exe_mask = df['exe'].str.lower() == exe.lower()
-            title_mask = df['title'] == title  # Exact match for titles
-            combined_mask = exe_mask & title_mask
-            df.loc[combined_mask, 'labeled_app_name'] = label
-        except Exception as e:
-            # Skip invalid patterns
-            print(f"Error with exact title match: {e}")
-            continue
-    
-    # Apply exact executable matches next
-    for exe, label in labels.get('exact_exe', {}).items():
-        mask = df['exe'].str.lower().str.contains(exe.lower())
-        # Only update those that haven't been labeled by exact title match
-        mask = mask & (df['labeled_app_name'] == df['original_app_name'])
-        df.loc[mask, 'labeled_app_name'] = label
-    
-    # Apply pattern matches last (lowest priority)
-    for key, label in labels.get('patterns', {}).items():
+            _, exe_from_key, title_from_key = key.split("::", 2)
+            mask = (df['exe'].str.lower() == exe_from_key.lower()) & \
+                   (df['title'] == title_from_key) # Case-sensitive title match
+            df.loc[mask, 'labeled_app_name'] = label_val
+        except ValueError: continue # Skip malformed keys
+        except Exception as e: print(f"Error applying exact title label for '{key}': {e}")
+
+    # Apply exact exe (basename): key is "BASENAME.exe"
+    for exe_basename_key, label_val in labels.get('exact_exe', {}).items():
+        # Apply only if not already labeled by a more specific rule (exact_title)
+        mask = (df['exe'].apply(lambda x: os.path.basename(x).lower()) == exe_basename_key.lower()) & \
+               (df['labeled_app_name'] == df['original_app_name']) 
+        df.loc[mask, 'labeled_app_name'] = label_val
+        
+    # Apply patterns (basename): key is "pattern::BASENAME.exe::TITLE_PATTERN"
+    for key, label_val in labels.get('patterns', {}).items():
         try:
-            _, exe, pattern = key.split("::", 2)
-            # Match both exe and title pattern
-            exe_mask = df['exe'].str.lower().str.contains(exe.lower())
-            title_mask = df['title'].str.lower().str.contains(pattern.lower())
-            combined_mask = exe_mask & title_mask
-            # Only update those that haven't been labeled by higher priority rules
-            combined_mask = combined_mask & (df['labeled_app_name'] == df['original_app_name'])
-            df.loc[combined_mask, 'labeled_app_name'] = label
-        except Exception as e:
-            # Skip invalid patterns
-            print(f"Error with pattern match: {e}")
-            continue
-    
-    # Update the app_name with the labeled version
-    df['app_name'] = df['labeled_app_name']
-    df.drop(columns=['labeled_app_name'], inplace=True)
-    
+            _, exe_basename_key, pattern_from_key = key.split("::", 2)
+            # Apply only if not already labeled by a more specific rule
+            mask = (df['exe'].apply(lambda x: os.path.basename(x).lower()).str.contains(exe_basename_key.lower(), regex=False)) & \
+                   (df['title'].str.lower().str.contains(pattern_from_key.lower(), regex=False)) & \
+                   (df['labeled_app_name'] == df['original_app_name'])
+            df.loc[mask, 'labeled_app_name'] = label_val
+        except ValueError: continue
+        except Exception as e: print(f"Error applying pattern label for '{key}': {e}")
+            
+    df['app_name'] = df['labeled_app_name'] # Final app_name is the labeled one
+    df.drop(columns=['labeled_app_name'], inplace=True, errors='ignore')
     return df
 
-def group_activities_for_labeling(logs_df):
-    """Group similar activities for easier labeling, focusing on window titles"""
-    if logs_df.empty:
+def group_activities_for_labeling(logs_df: pd.DataFrame) -> pd.DataFrame:
+    if logs_df.empty or 'title' not in logs_df.columns:
         return pd.DataFrame()
     
-    # Extract key information about window titles
-    title_groups = []
+    # Ensure necessary columns exist and handle NaNs
+    for col, default_val in [('app_name', "Unknown Application"), ('exe', "unknown.exe"), ('duration', 0)]:
+        if col not in logs_df.columns:
+            logs_df[col] = default_val
+        logs_df[col] = logs_df[col].fillna(default_val)
+
+    logs_df['title'] = logs_df['title'].astype(str) # Ensure title is string for grouping
     
-    # First, get a count of each unique window title
-    title_counts = logs_df['title'].value_counts().reset_index()
-    title_counts.columns = ['title', 'count']
-    
-    # For each title, get app, duration, etc.
-    for _, row in title_counts.iterrows():
-        title = row['title']
-        count = row['count']
-        
-        # Get all logs with this title
-        title_logs = logs_df[logs_df['title'] == title]
-        
-        # Get the main app for this title - safely handling empty cases
-        try:
-            mode_result = title_logs['app_name'].mode()
-            main_app = mode_result.iloc[0] if not mode_result.empty else "Unknown"
-        except:
-            main_app = title_logs['app_name'].iloc[0] if not title_logs.empty else "Unknown"
-            
-        # Same for exe
-        try:
-            mode_result = title_logs['exe'].mode()
-            main_exe = mode_result.iloc[0] if not mode_result.empty else "Unknown"
-        except:
-            main_exe = title_logs['exe'].iloc[0] if not title_logs.empty else "Unknown"
-        
-        # Calculate total duration for this title
-        total_duration = title_logs['duration'].sum()
-        
-        title_groups.append({
-            'title': title,
-            'app_name': main_app,
-            'exe': main_exe,
-            'count': count,
-            'duration': total_duration
+    # Group by title, then find mode for app_name and exe, sum duration
+    title_groups_data = []
+    for title_val, group in logs_df.groupby('title'):
+        app_name_mode = group['app_name'].mode()
+        exe_mode = group['exe'].mode()
+        title_groups_data.append({
+            'title': title_val,
+            'app_name': app_name_mode[0] if not app_name_mode.empty else "Unknown Application",
+            'exe': exe_mode[0] if not exe_mode.empty else "unknown.exe", # Store full path
+            'count': len(group),
+            'duration': group['duration'].sum()
         })
-    
-    # Convert to DataFrame
-    grouped = pd.DataFrame(title_groups)
-    
-    # Add percentage of total time
-    total_time = logs_df['duration'].sum()
-    if total_time > 0:
-        grouped['percentage'] = (grouped['duration'] / total_time * 100).round(1)
-    else:
-        grouped['percentage'] = 0
-    
-    # Sort by duration
-    return grouped.sort_values('duration', ascending=False)
+        
+    grouped_df = pd.DataFrame(title_groups_data)
+    if not grouped_df.empty:
+        total_log_duration = logs_df['duration'].sum()
+        grouped_df['percentage'] = (grouped_df['duration'] / total_log_duration * 100).round(1) if total_log_duration > 0 else 0.0
+        return grouped_df.sort_values('duration', ascending=False)
+    return pd.DataFrame()
 
-# --- Feedback Management Functions ---
-def load_block_feedback():
-    """Load saved feedback for time blocks"""
-    if not FEEDBACK_FILE.exists():
-        return {}
+
+# --- Feedback Management Functions (for block_feedback.json - Personal Notes) ---
+def load_block_feedback() -> Dict[str, str]:
+    if not FEEDBACK_FILE.exists(): return {}
     try:
-        with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        st.error(f"Error loading feedback: {e}")
-        return {}
+        with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+    except Exception as e: st.error(f"Error loading personal notes (feedback file): {e}"); return {}
 
-
-def save_block_feedback(feedback):
-    """Save feedback mapping to file"""
+def save_block_feedback(feedback_data: Dict[str, str]) -> bool:
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
-            json.dump(feedback, f, indent=2)
+        with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f: json.dump(feedback_data, f, indent=2)
         return True
-    except Exception as e:
-        st.error(f"Error saving feedback: {e}")
-        return False
+    except Exception as e: st.error(f"Error saving personal notes (feedback file): {e}"); return False
 
-
-def load_time_buckets(date_str):
-    """Load 5-minute time bucket summaries for a given date"""
-    buckets = []
-    for path in LOGS_DIR.glob('time_buckets_*.json'):
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                for b in data:
-                    start = b.get('start', '')
-                    if start.split('T')[0] == date_str:
-                        buckets.append(b)
-        except Exception:
-            continue
-    buckets.sort(key=lambda x: x.get('start'))
-    return buckets
-
-# --- Visualization Functions ---
-def create_pie_chart(app_data):
-    """Create a plotly pie chart from app data"""
-    if len(app_data) > 10:
-        # If more than 10 apps, group smaller ones as "Other"
-        top_apps = app_data[:10]
-        other_time = sum(app["timeSpent"] for app in app_data[10:])
-        other_percentage = sum(app["percentage"] for app in app_data[10:])
-        
-        if other_time > 0:
-            top_apps.append({
-                "appName": "Other Apps",
-                "timeSpent": other_time,
-                "percentage": other_percentage
-            })
-    else:
-        top_apps = app_data
-    
-    labels = [f"{app['appName']} ({app['timeSpent'] // 60}m)" for app in top_apps]
-    values = [app["timeSpent"] for app in top_apps]
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=0.3,
-        textinfo='percent',
-        hoverinfo='label+value',
-        textfont_size=14
-    )])
-    
-    fig.update_layout(
-        title="App Usage Breakdown",
-        height=500
-    )
-    
-    return fig
-
-def create_browser_chart(app_data):
-    """Create a chart focusing on browser usage"""
-    # Extract browser data
-    browser_data = []
-    for app in app_data:
-        app_name_lower = app["appName"].lower()
-        
-        # Check if this is a browser
-        is_chrome = "chrome" in app_name_lower
-        is_edge = "msedge" in app_name_lower or "edge" in app_name_lower
-        is_firefox = "firefox" in app_name_lower
-        
-        if is_chrome or is_edge or is_firefox:
-            # Group by browser type for color coding
-            if is_edge:
-                browser_type = "Microsoft Edge"
-            elif is_chrome:
-                browser_type = "Google Chrome"
-            else:
-                browser_type = "Firefox"
-            
-            # Add to the browser data
-            browser_data.append({
-                "appName": app["appName"],
-                "timeSpent": app["timeSpent"],
-                "percentage": app["percentage"],
-                "browserType": browser_type
-            })
-    
-    if not browser_data:
-        return None
-    
-    # Sort by browser type then by time spent
-    browser_data.sort(key=lambda x: (x["browserType"], -x["timeSpent"]))
-    
-    # Create the visualization
-    labels = [app["appName"] for app in browser_data]
-    values = [app["timeSpent"] for app in browser_data]
-    browser_types = [app["browserType"] for app in browser_data]
-    minutes = [f"{app['timeSpent'] // 60}m" for app in browser_data]
-    
-    fig = px.bar(
-        x=labels, 
-        y=values,
-        text=minutes,
-        labels={"x": "Browser", "y": "Time (seconds)"},
-        title="Browser Usage",
-        color=browser_types,
-        color_discrete_map={
-            "Microsoft Edge": "#0078D7",
-            "Google Chrome": "#4285F4",
-            "Firefox": "#FF9500"
-        }
-    )
-    
-    fig.update_layout(
-        xaxis_tickangle=-45,
-        height=400,
-        legend_title="Browser Type"
-    )
-    
-    return fig
-
-def check_for_chart_image(date_str):
-    """Check if a pre-generated chart image exists"""
-    chart_path = LOGS_DIR / f"usage_chart_{date_str}.png"
-    return chart_path if chart_path.exists() else None
-
-# --- Time Bucket Summary Functions ---
-def load_time_buckets_for_date(date_str):
-    """Load all 5-minute buckets for the specified date."""
-    buckets = []
+# --- Time Bucket Management Functions (for time_buckets_*.json files - Official Summaries) ---
+def load_time_buckets_for_date(date_str: str) -> List[Dict[str, Any]]:
+    buckets_with_tags = []
     for path in LOGS_DIR.glob("time_buckets_*.json"):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            session_tag = path.name.replace("time_buckets_", "").replace(".json", "")
+            with open(path, "r", encoding="utf-8") as f: data = json.load(f)
             for b in data:
                 if b.get("start", "")[:10] == date_str:
-                    buckets.append(b)
-        except Exception as e:
-            st.error(f"Error reading {path}: {e}")
-    buckets.sort(key=lambda x: x.get("start", ""))
-    return buckets
+                    b_copy = b.copy()
+                    b_copy['session_tag'] = session_tag # Crucial for identifying source file
+                    buckets_with_tags.append(b_copy)
+        except Exception as e: st.error(f"Error reading bucket file {path.name}: {e}")
+    buckets_with_tags.sort(key=lambda x: x.get("start", ""))
+    return buckets_with_tags
 
-def load_feedback():
-    """Load saved feedback for time buckets."""
-    if not FEEDBACK_FILE.exists():
-        return {}
+def update_bucket_summary_in_file(session_tag: str, bucket_start_iso: str, new_summary: str) -> bool:
+    bucket_file_path = LOGS_DIR / f"time_buckets_{session_tag}.json"
+    if not bucket_file_path.exists(): st.error(f"Official summary file not found: {bucket_file_path.name}"); return False
     try:
-        with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        st.error(f"Error loading feedback: {e}")
-        return {}
-
-def save_feedback(feedback):
-    """Save feedback dictionary to file."""
-    try:
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        with open(FEEDBACK_FILE, "w", encoding="utf-8") as f:
-            json.dump(feedback, f, indent=2)
+        with open(bucket_file_path, "r", encoding="utf-8") as f: all_buckets_data = json.load(f)
+        found_bucket = False
+        for bucket_data in all_buckets_data:
+            if bucket_data.get("start") == bucket_start_iso:
+                bucket_data["summary"] = new_summary; found_bucket = True; break
+        if not found_bucket: st.error(f"Bucket {bucket_start_iso} not found in {bucket_file_path.name}"); return False
+        with open(bucket_file_path, "w", encoding="utf-8") as f: json.dump(all_buckets_data, f, indent=2)
         return True
-    except Exception as e:
-        st.error(f"Error saving feedback: {e}")
-        return False
+    except Exception as e: st.error(f"Error updating official summary in {bucket_file_path.name}: {e}"); return False
 
+# --- LLM Interaction Functions ---
+def _call_llm_api(prompt: str, operation_name: str) -> Optional[str]:
+    """Generic LLM API call helper."""
+    payload = {"model": LLM_MODEL, "prompt": prompt, "stream": False}
+    try:
+        st.info(f"Sending request to LLM ({LLM_MODEL}) for {operation_name}...")
+        response = requests.post(LLM_API_URL, json=payload, timeout=60) # Timeout of 60s
+        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        data = response.json()
+        llm_response_text = data.get("response", "").strip()
+        if not llm_response_text and prompt: # Warn if prompt was non-empty but response is
+             st.warning(f"LLM returned an empty response for {operation_name}.")
+        st.success(f"LLM {operation_name} successful.")
+        return llm_response_text
+    except requests.exceptions.Timeout: 
+        st.error(f"LLM API request timed out ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}.")
+    except requests.exceptions.RequestException as e: 
+        st.error(f"LLM API communication error ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}: {e}")
+    except Exception as e: 
+        st.error(f"An unexpected error occurred during LLM {operation_name}: {e}")
+    return None
+
+
+def refine_summary_with_llm(original_summary: str, user_feedback: str) -> Optional[str]:
+    prompt = f"""Current summary of activity:
+"{original_summary}"
+
+User's feedback or additional details:
+"{user_feedback}"
+
+Based on the current summary and the user's input, please provide an improved and concise summary.
+If the user's input suggests a complete rewrite, then generate that new summary.
+Focus on integrating the user's points accurately.
+Output only the new summary text.
+"""
+    return _call_llm_api(prompt, "refinement")
+
+def generate_summary_from_raw_with_llm(bucket_titles: List[str], bucket_ocr_texts: List[str]) -> Optional[str]:
+    titles_to_send = [str(t) for t in bucket_titles if t and str(t).strip()] if bucket_titles else []
+    ocr_to_send = [str(o) for o in bucket_ocr_texts if o and str(o).strip()] if bucket_ocr_texts else []
+    
+    text_parts = list(set(titles_to_send + ocr_to_send)) # Unique raw data points
+    if not text_parts:
+        st.info("No raw titles or OCR text available in this bucket to generate a summary.")
+        return "" # Return empty string to signify no summary could be made from raw
+
+    prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
+    if titles_to_send:
+        prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in titles_to_send]) + "\n\n"
+    if ocr_to_send:
+        prompt_text += "Detected Text (OCR Snippets):\n" + "\n".join([f"- \"{o}\"" for o in ocr_to_send]) + "\n\n"
+    prompt_text += "Output only the summary text."
+    return _call_llm_api(prompt_text, "raw data summarization")
+
+
+# --- Visualization Functions ---
+def create_pie_chart(app_data: List[Dict[str, Any]]) -> go.Figure:
+    fig = go.Figure()
+    if not app_data: 
+        fig.update_layout(title="App Usage Breakdown - No Data Available")
+        return fig
+
+    # Group small slices into "Other"
+    data_to_plot = sorted(app_data, key=lambda x: x.get("timeSpent", 0), reverse=True)
+    if len(data_to_plot) > 10:
+        top_apps = data_to_plot[:9] # Show top 9
+        other_time = sum(app.get("timeSpent", 0) for app in data_to_plot[9:])
+        if other_time > 0:
+            top_apps.append({"appName": "Other Apps", "timeSpent": other_time})
+        data_to_plot = top_apps
+    
+    labels = [f"{app.get('appName','N/A')} ({app.get('timeSpent',0)//60}m)" for app in data_to_plot]
+    values = [app.get('timeSpent',0) for app in data_to_plot]
+    
+    if not values or sum(values) == 0: # Handle case where all values are zero
+        fig.update_layout(title="App Usage Breakdown - No Time Spent Data")
+        return fig
+
+    fig.add_trace(go.Pie(labels=labels, values=values, hole=0.3, textinfo='percent+label', 
+                         hoverinfo='label+value', textfont_size=12, pull=[0.05]*len(labels)))
+    fig.update_layout(title_text="App Usage Breakdown", height=500, legend_title_text="Applications")
+    return fig
+
+def create_browser_chart(app_data: List[Dict[str, Any]]) -> Optional[go.Figure]:
+    if not app_data: return None
+    browser_entries = []
+    for app in app_data:
+        name_lower = app.get("appName","").lower()
+        if any(b_keyword in name_lower for b_keyword in ["chrome", "msedge", "edge", "firefox"]):
+            browser_type = "MS Edge" if "msedge" in name_lower or "edge" in name_lower else \
+                           ("Google Chrome" if "chrome" in name_lower else "Firefox")
+            browser_entries.append({**app, "browserType": browser_type}) # Add type for coloring
+    
+    if not browser_entries: return None
+    
+    df_browsers = pd.DataFrame(browser_entries).sort_values(by=["browserType", "timeSpent"], ascending=[True, False])
+    df_browsers["timeSpentMinutesText"] = (df_browsers["timeSpent"] // 60).astype(str) + "m"
+
+    fig = px.bar(df_browsers, x="appName", y="timeSpent", 
+                 text="timeSpentMinutesText",
+                 labels={"appName": "Browser Instance / Profile", "timeSpent": "Time Spent (seconds)"}, 
+                 title="Browser Usage Details", color="browserType",
+                 color_discrete_map={"MS Edge": "#0078D4", "Google Chrome": "#DB4437", "Firefox": "#FF7139"})
+    fig.update_layout(xaxis_tickangle=-45, height=450, legend_title_text="Browser Type", uniformtext_minsize=8, uniformtext_mode='hide')
+    fig.update_traces(textposition='outside')
+    return fig
+
+
+# --- Time Bucket Summaries Page ---
 def display_time_bucket_summaries():
-    """Display 5-minute summaries with editable feedback fields."""
-    st.title("📝 5-Minute Summaries")
-
+    st.title("📝 5-Minute Summaries & Feedback")
     dates = load_available_dates()
-    if not dates:
-        st.error("No data found in focus_logs directory.")
-        st.stop()
+    if not dates: st.error("No data found in focus_logs directory."); st.stop()
+    selected_date = st.selectbox("Select a date", dates, key="summaries_date_select")
+    
+    official_buckets = load_time_buckets_for_date(selected_date)
+    personal_notes_data = load_block_feedback() 
 
-    selected_date = st.selectbox("Select a date", dates)
+    if not official_buckets: st.info(f"No 5-minute summary blocks found for {selected_date}."); return
 
-    buckets = load_time_buckets_for_date(selected_date)
-    feedback = load_feedback()
+    for idx, bucket_data in enumerate(official_buckets):
+        bucket_start_iso = bucket_data["start"]
+        session_tag = bucket_data.get("session_tag", "unknown_session")
+        
+        start_dt = pd.to_datetime(bucket_start_iso)
+        end_dt = pd.to_datetime(bucket_data.get("end", bucket_start_iso))
+        time_range_display = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} (UTC {start_dt.strftime('%Y-%m-%d')})"
+        
+        current_official_summary_text = bucket_data.get("summary", "") # This is from time_buckets_*.json
+        current_personal_note_text = personal_notes_data.get(bucket_start_iso, "")
 
-    if not buckets:
-        st.info(f"No 5-minute summaries found for {selected_date}.")
-        return
+        with st.expander(time_range_display):
+            st.markdown("**Current Official Summary (from log file):**")
+            st.caption(current_official_summary_text or "_No official summary available for this block._")
+            
+            st.markdown("**Your Input Text:**")
+            user_input_text = st.text_area(
+                "Use this text area to: (1) Save a personal note, (2) Provide feedback for the LLM to refine the summary, or (3) Write your own summary to replace the current one.", 
+                value=current_personal_note_text, 
+                key=f"user_text_area_{idx}_{bucket_start_iso}",
+                height=100 # Adjust height as needed
+            )
 
-    for idx, bucket in enumerate(buckets):
-        start = pd.to_datetime(bucket["start"]).strftime("%H:%M")
-        end = pd.to_datetime(bucket["end"]).strftime("%H:%M")
-        summary = bucket.get("summary", "")
-        key = bucket["start"]
-        existing_fb = feedback.get(key, "")
-        with st.expander(f"{start} - {end}"):
-            st.write(summary or "_No summary available_")
-            text = st.text_area("Feedback", value=existing_fb, key=f"fb_{idx}")
-            cols = st.columns(2)
-            if cols[0].button("Save", key=f"save_{idx}"):
-                feedback[key] = text.strip()
-                save_feedback(feedback)
-                st.success("Saved feedback")
-            if cols[1].button("Delete", key=f"delete_{idx}"):
-                if key in feedback:
-                    del feedback[key]
-                    save_feedback(feedback)
-                    st.success("Deleted feedback")
+            # --- Personal Note Actions ---
+            st.markdown("---")
+            st.write("**Manage Personal Note (Saved Separately):**")
+            note_cols = st.columns(2)
+            if note_cols[0].button("Save Input as Personal Note", key=f"save_personal_note_{idx}_{bucket_start_iso}", help="Saves the text in the 'Your Input Text' area above as a private note for this block. This does NOT change the Official Summary."):
+                personal_notes_data[bucket_start_iso] = user_input_text.strip()
+                if save_block_feedback(personal_notes_data): st.success("Personal note saved!")
+                else: st.error("Failed to save personal note.")
+            
+            if note_cols[1].button("Delete Personal Note", key=f"delete_personal_note_{idx}_{bucket_start_iso}", help="Deletes the private note associated with this block."):
+                if bucket_start_iso in personal_notes_data:
+                    del personal_notes_data[bucket_start_iso]
+                    if save_block_feedback(personal_notes_data): 
+                        st.success("Personal note deleted!"); time.sleep(0.5); st.rerun()
+                    else: st.error("Failed to delete personal note.")
+                else: st.info("No personal note to delete for this block.")
+
+            # --- Official Summary Actions (Modifies time_buckets_*.json) ---
+            st.markdown("---")
+            st.write("**Manage Official Summary (Modifies Log File):**")
+            official_summary_action_cols = st.columns(3)
+            
+            with official_summary_action_cols[0]:
+                if st.button("Set as Official Summary", key=f"set_official_summary_from_input_{idx}_{bucket_start_iso}", help="Replaces the 'Current Official Summary' above with the text from the 'Your Input Text' area. This directly modifies the summary in the log file."):
+                    if user_input_text.strip():
+                        if update_bucket_summary_in_file(session_tag, bucket_start_iso, user_input_text.strip()):
+                            st.success("Official summary updated with your input!"); time.sleep(1); st.rerun()
+                        else: st.error("Failed to update official summary with your input.")
+                    else: st.warning("Text area is empty. Please enter text to set as the official summary.")
+            
+            with official_summary_action_cols[1]:
+                if st.button("Refine LLM Summary", key=f"refine_llm_summary_btn_{idx}_{bucket_start_iso}", help="Uses the 'Current Official Summary' AND the text from 'Your Input Text' (as feedback) to ask the LLM to generate an improved summary. This new summary will replace the current one in the log file."):
+                    if user_input_text.strip(): 
+                        refined_summary_text = refine_summary_with_llm(current_official_summary_text, user_input_text.strip())
+                        if refined_summary_text is not None:
+                            if update_bucket_summary_in_file(session_tag, bucket_start_iso, refined_summary_text):
+                                st.success("LLM summary refined and updated!"); time.sleep(1); st.rerun()
+                            else: st.error("Failed to save LLM-refined official summary.")
+                    else: st.warning("Please enter some feedback in the 'Your Input Text' area to help refine the summary.")
+
+            with official_summary_action_cols[2]:
+                if st.button("Re-Generate Original LLM Summary", key=f"regenerate_original_llm_summary_btn_{idx}_{bucket_start_iso}", help="Asks the LLM to create a brand new summary based on the raw window titles and OCR text recorded for this block. This will replace the 'Current Official Summary' in the log file."):
+                    raw_titles_list = bucket_data.get("titles", [])
+                    raw_ocr_list = bucket_data.get("ocr_text", [])
+                    regenerated_summary_text = generate_summary_from_raw_with_llm(raw_titles_list, raw_ocr_list)
+                    if regenerated_summary_text is not None: 
+                        if update_bucket_summary_in_file(session_tag, bucket_start_iso, regenerated_summary_text):
+                            st.success("Original LLM summary re-generated and updated!"); time.sleep(1); st.rerun()
+                        else: st.error("Failed to save LLM re-generated official summary.")
+
 
 # --- Label Editor Page ---
 def display_label_editor():
-    st.title("🏷 Label Editor")
-    
-    # Select date for labeling
+    st.title("🏷 Activity Label Editor")
     available_dates = load_available_dates()
-    if not available_dates:
-        st.error("No data found in focus_logs directory.")
-        st.warning("Focus monitor must be running to collect data.")
-        st.stop()
+    if not available_dates: st.error("No data found in focus_logs directory."); st.stop()
+    selected_date = st.selectbox("Select a date for labeling activities", available_dates, key="label_editor_date_select")
     
-    selected_date = st.selectbox("Select a date to label activities", available_dates)
+    logs_df_for_labeling = load_log_entries(selected_date)
+    if logs_df_for_labeling.empty: st.warning(f"No log entries found for {selected_date} to label."); st.stop()
     
-    # Load logs for the selected date
-    logs_df = load_log_entries(selected_date)
-    if logs_df.empty:
-        st.warning(f"No log entries available for {selected_date}")
-        st.stop()
+    # title_groups will contain 'exe' as full path
+    title_groups_for_labeling = group_activities_for_labeling(logs_df_for_labeling) 
     
-    # Group activities by window title for easier labeling
-    try:
-        title_groups = group_activities_for_labeling(logs_df)
-    except Exception as e:
-        st.error(f"Error grouping activities: {e}")
-        title_groups = pd.DataFrame()
-        
-    if title_groups.empty:
-        st.warning("No valid window titles found to label")
-        return
-    
-    # Load existing labels
-    labels = load_labels()
-    
-    # Display current labels
+    # For forms needing basenames (App Label, Pattern Label)
+    all_exe_basenames_in_logs = sorted(list(set(
+        os.path.basename(str(exe)) for exe in logs_df_for_labeling['exe'].dropna().unique() if 'exe' in logs_df_for_labeling
+    )))
+
+    current_labels = load_labels()
+    for k_label_type in ['exact_titles', 'exact_exe', 'patterns']: # Ensure keys exist
+        current_labels.setdefault(k_label_type, {})
+
     st.subheader("Current Custom Labels")
-    
-    if not labels.get('exact_exe', {}) and not labels.get('patterns', {}) and not labels.get('exact_titles', {}):
+    if not any(current_labels.get(k) for k in ['exact_titles', 'exact_exe', 'patterns']):
         st.info("No custom labels defined yet. Use the forms below to create labels.")
     else:
-        # Create tabs for different label types
-        label_tab1, label_tab2, label_tab3 = st.tabs(["Window Title Labels", "Application Labels", "Pattern Labels"])
-        
-        # Tab 1: Exact window title labels
-        with label_tab1:
-            if not labels.get('exact_titles', {}):
-                st.info("No window title labels defined yet.")
-            else:
-                title_labels = []
-                for key, label in labels.get('exact_titles', {}).items():
-                    try:
-                        _, exe, title = key.split("::", 2)
-                        title_labels.append({
-                            "Application": os.path.basename(exe),
-                            "Window Title": title[:50] + ("..." if len(title) > 50 else ""),
-                            "Label": label
-                        })
-                    except:
-                        continue
-                
-                if title_labels:
-                    st.dataframe(pd.DataFrame(title_labels), use_container_width=True)
-        
-        # Tab 2: Application labels
-        with label_tab2:
-            if not labels.get('exact_exe', {}):
-                st.info("No application labels defined yet.")
-            else:
-                exe_labels_df = pd.DataFrame([
-                    {"Application": os.path.basename(exe), "Label": label}
-                    for exe, label in labels.get('exact_exe', {}).items()
-                ])
-                st.dataframe(exe_labels_df, use_container_width=True)
-        
-        # Tab 3: Pattern-based labels
-        with label_tab3:
-            if not labels.get('patterns', {}):
-                st.info("No pattern labels defined yet.")
-            else:
-                pattern_labels = []
-                for key, label in labels.get('patterns', {}).items():
-                    try:
-                        _, exe, pattern = key.split("::", 2)
-                        pattern_labels.append({
-                            "Application": os.path.basename(exe),
-                            "Window Title Pattern": pattern,
-                            "Label": label
-                        })
-                    except:
-                        continue
-                
-                if pattern_labels:
-                    st.dataframe(pd.DataFrame(pattern_labels), use_container_width=True)
+        ltab1, ltab2, ltab3 = st.tabs(["Window Title Labels", "Application Labels (Basename)", "Pattern Labels (Basename)"])
+        with ltab1: # Exact Titles (Key: exact::FULL_EXE_PATH::TITLE)
+            data = [{"Key": k, "Label": v, "App": k.split("::")[1], "Title": k.split("::")[2][:70]+"..."} 
+                    for k,v in current_labels.get('exact_titles',{}).items() if k.count("::")==2]
+            if data: st.dataframe(pd.DataFrame(data)[["App", "Title", "Label"]], use_container_width=True)
+            else: st.info("No window title labels defined.")
+        with ltab2: # Exact Exe (Key: BASENAME.exe)
+            data = [{"App Basename": k, "Label": v} for k,v in current_labels.get('exact_exe',{}).items()]
+            if data: st.dataframe(pd.DataFrame(data), use_container_width=True)
+            else: st.info("No application basename labels defined.")
+        with ltab3: # Patterns (Key: pattern::BASENAME.exe::PATTERN_STRING)
+            data = [{"App Basename": k.split("::")[1], "Title Pattern": k.split("::")[2], "Label": v} 
+                    for k,v in current_labels.get('patterns',{}).items() if k.count("::")==2]
+            if data: st.dataframe(pd.DataFrame(data), use_container_width=True)
+            else: st.info("No pattern labels defined.")
     
-    # Ensure all required label types exist
-    if 'exact_exe' not in labels:
-        labels['exact_exe'] = {}
-    if 'patterns' not in labels:
-        labels['patterns'] = {}
-    if 'exact_titles' not in labels:
-        labels['exact_titles'] = {}
-    
-    # Display window titles for labeling
-    st.subheader("Available Window Titles")
-    
-    # Show hint about labeling
-    st.info("💡 Tip: Label specific window titles to categorize your activities more precisely.")
-    
-    # Create a dataframe for display
-    title_df = pd.DataFrame({
-        "Window Title": title_groups['title'],
-        "Application": title_groups['app_name'],
-        "Duration": title_groups['duration'].apply(lambda x: f"{x // 60} minutes"),
-        "Count": title_groups['count'],
-        "Percentage": title_groups['percentage'].apply(lambda x: f"{x}%")
-    })
-    
-    # Display the titles with a filter
-    title_filter = st.text_input("Filter window titles", "")
-    if title_filter:
-        filtered_df = title_df[title_df["Window Title"].str.contains(title_filter, case=False) | 
-                              title_df["Application"].str.contains(title_filter, case=False)]
-        st.dataframe(filtered_df, use_container_width=True)
+    if not title_groups_for_labeling.empty:
+        st.subheader("Available Window Titles for Labeling (from Grouped Activities)")
+        st.dataframe(title_groups_for_labeling[["title", "app_name", "exe", "duration"]].head(20), use_container_width=True, height=300) # Show top 20
     else:
-        st.dataframe(title_df, use_container_width=True)
-    
-    # Create tabs for different label types
-    tab1, tab2, tab3 = st.tabs(["Label Specific Window Title", "Label Application", "Label by Pattern"])
-    
-    # Tab 1: Label Specific Window Title
-    with tab1:
-        st.write("Create labels for specific window titles")
-        
-        # Get titles from the logs
-        titles = title_groups['title'].tolist()
-        
-        if not titles:
-            st.warning("No window titles available to label")
-        else:
-            # First, let users filter titles (optional)
-            title_filter_for_selection = st.text_input("Filter titles for selection", "", key="title_filter_selection")
-            
-            # Create a filtered list of titles
-            if title_filter_for_selection:
-                filtered_titles = [t for t in titles if title_filter_for_selection.lower() in t.lower()]
-                if not filtered_titles:
-                    st.warning("No titles match your filter")
-                    filtered_titles = titles
-            else:
-                filtered_titles = titles
-            
-            # Show duration info for each title
-            title_info = {}
-            for title in filtered_titles:
-                row = title_groups.loc[title_groups['title'] == title].iloc[0]
-                duration_mins = row['duration'] // 60
-                title_info[title] = f"({duration_mins} mins)"
-            
-            # Create a multi-select for titles
-            selected_titles = st.multiselect(
-                "Select window titles to label",
-                options=filtered_titles,
-                format_func=lambda t: f"{t[:80]}... {title_info.get(t, '')}" if len(t) > 80 else f"{t} {title_info.get(t, '')}"
-            )
-            
-            if selected_titles:
-                # Calculate combined time for selected titles
-                combined_time = 0
-                for title in selected_titles:
-                    row = title_groups.loc[title_groups['title'] == title].iloc[0]
-                    combined_time += row['duration']
-                
-                # ENHANCEMENT: Create a more prominent time display with metrics and colors
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric(
-                        f"✅ Selected {len(selected_titles)} window titles",
-                        f"{combined_time // 60} minutes"
-                    )
-                with col2:
-                    st.metric(
-                        "Total Hours", 
-                        f"{(combined_time / 3600):.2f} hours"
-                    )
-                
-                # Add a divider to make the section stand out
-                st.markdown("---")
-                
-                # Show form for labeling
-                with st.form("title_label_form"):
-                    # Check if we already have a common label for these titles
-                    common_label = None
-                    for title in selected_titles:
-                        selected_exe = title_groups.loc[title_groups['title'] == title, 'exe'].iloc[0]
-                        title_key = f"exact::{selected_exe}::{title}"
-                        if title_key in labels.get('exact_titles', {}):
-                            if common_label is None:
-                                common_label = labels['exact_titles'][title_key]
-                            elif common_label != labels['exact_titles'][title_key]:
-                                common_label = ""  # Different labels found
-                    
-                    # Input for the label
-                    title_label = st.text_input(
-                        f"Label for the {len(selected_titles)} selected window titles ({combined_time // 60} min total)", 
-                        value=common_label or ""
-                    )
-                    
-                    submit_title = st.form_submit_button("Apply Label to Selected Titles")
-                    
-                    if submit_title:
-                        if title_label.strip():
-                            # Apply the same label to all selected titles
-                            for title in selected_titles:
-                                selected_exe = title_groups.loc[title_groups['title'] == title, 'exe'].iloc[0]
-                                title_key = f"exact::{selected_exe}::{title}"
-                                labels['exact_titles'][title_key] = title_label.strip()
-                            
-                            save_labels(labels)
-                            st.success(f"Saved label '{title_label}' for {len(selected_titles)} window titles")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            # Remove labels if empty
-                            removed_count = 0
-                            for title in selected_titles:
-                                selected_exe = title_groups.loc[title_groups['title'] == title, 'exe'].iloc[0]
-                                title_key = f"exact::{selected_exe}::{title}"
-                                if title_key in labels['exact_titles']:
-                                    del labels['exact_titles'][title_key]
-                                    removed_count += 1
-                            
-                            if removed_count > 0:
-                                save_labels(labels)
-                                st.success(f"Removed labels from {removed_count} window titles")
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.warning("No labels to remove")
-            else:
-                st.info("Select one or more window titles to label them")
-    
-    # Tab 2: Application Label
-    with tab2:
-        with st.form("app_label_form"):
-            st.write("Create a label for an entire application")
-            
-            # Get executables from the logs
-            exes = sorted(logs_df['exe'].unique())
-            exe_options = [os.path.basename(exe) for exe in exes]
-            
-            if not exe_options:
-                st.warning("No applications available to label")
-                submit_app = st.form_submit_button("Save Application Label", disabled=True)
-            else:
-                exe_index = st.selectbox(
-                    "Select Application", 
-                    options=range(len(exe_options)),
-                    format_func=lambda i: exe_options[i]
-                )
-                
-                selected_exe = exe_options[exe_index]
-                
-                app_label = st.text_input("Label for this application", 
-                                        value=labels['exact_exe'].get(selected_exe, ""))
-                
-                submit_app = st.form_submit_button("Save Application Label")
-                
-                if submit_app:
-                    if app_label.strip():
-                        labels['exact_exe'][selected_exe] = app_label.strip()
-                        save_labels(labels)
-                        st.success(f"Saved label '{app_label}' for {selected_exe}")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        # Remove label if empty
-                        if selected_exe in labels['exact_exe']:
-                            del labels['exact_exe'][selected_exe]
-                            save_labels(labels)
-                            st.success(f"Removed label for {selected_exe}")
-                            time.sleep(1)
-                            st.rerun()
-    
-    # Tab 3: Pattern-Based Label
-    with tab3:
-        with st.form("pattern_label_form"):
-            st.write("Create a label for activities matching a specific pattern")
-            
-            # Get executables from the logs
-            if not exe_options:
-                st.warning("No applications available for pattern matching")
-                submit_pattern = st.form_submit_button("Save Pattern Label", disabled=True)
-            else:
-                pattern_exe_index = st.selectbox(
-                    "Select Application (for pattern)", 
-                    options=range(len(exe_options)),
-                    format_func=lambda i: exe_options[i],
-                    key="pattern_exe"
-                )
-                
-                pattern_exe = exe_options[pattern_exe_index]
-                
-                title_pattern = st.text_input("Window Title Pattern (case insensitive)")
-                pattern_label = st.text_input("Pattern Label")
-                
-                # Create key for lookup
-                pattern_key = f"pattern::{pattern_exe}::{title_pattern}"
-                
-                submit_pattern = st.form_submit_button("Save Pattern Label")
-                
-                if submit_pattern:
-                    if pattern_label.strip() and title_pattern.strip():
-                        labels['patterns'][pattern_key] = pattern_label.strip()
-                        save_labels(labels)
-                        st.success(f"Saved pattern label '{pattern_label}' for {pattern_exe} with pattern '{title_pattern}'")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("Both pattern and label must be provided")
-    
-    # Delete labels section
-    st.subheader("Delete Labels")
-    
-    tab_del1, tab_del2, tab_del3 = st.tabs(["Delete Window Title Label", "Delete Application Label", "Delete Pattern Label"])
-    
-    # Tab 1: Delete Window Title Label
-    with tab_del1:
-        if not labels.get('exact_titles', {}):
-            st.info("No window title labels to delete")
-        else:
-            title_keys = []
-            title_display = {}
-            
-            for key in labels.get('exact_titles', {}).keys():
-                try:
-                    _, exe, title = key.split("::", 2)
-                    display = f"{os.path.basename(exe)} - '{title[:50]}...': {labels['exact_titles'][key]}"
-                    title_keys.append(key)
-                    title_display[key] = display
-                except:
-                    continue
-            
-            if title_keys:
-                title_to_delete = st.selectbox("Select window title label to delete",
-                                             options=title_keys,
-                                             format_func=lambda x: title_display[x])
-                
-                if st.button("Delete Window Title Label"):
-                    del labels['exact_titles'][title_to_delete]
-                    save_labels(labels)
-                    st.success(f"Deleted window title label")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.info("No valid window title labels to delete")
-    
-    # Tab 2: Delete Application Label
-    with tab_del2:
-        if not labels.get('exact_exe', {}):
-            st.info("No application labels to delete")
-        else:
-            label_to_delete = st.selectbox("Select label to delete",
-                                         options=list(labels['exact_exe'].keys()),
-                                         format_func=lambda x: f"{x}: {labels['exact_exe'][x]}")
-            
-            if st.button("Delete Application Label"):
-                del labels['exact_exe'][label_to_delete]
-                save_labels(labels)
-                st.success(f"Deleted label for {label_to_delete}")
-                time.sleep(1)
-                st.rerun()
-    
-    # Tab 3: Delete Pattern Label
-    with tab_del3:
-        if not labels.get('patterns', {}):
-            st.info("No pattern labels to delete")
-        else:
-            pattern_keys = []
-            pattern_display = {}
-            
-            for key in labels.get('patterns', {}).keys():
-                try:
-                    _, exe, pattern = key.split("::", 2)
-                    display = f"{exe} - '{pattern}': {labels['patterns'][key]}"
-                    pattern_keys.append(key)
-                    pattern_display[key] = display
-                except:
-                    continue
-            
-            if pattern_keys:
-                pattern_to_delete = st.selectbox("Select pattern to delete",
-                                               options=pattern_keys,
-                                               format_func=lambda x: pattern_display[x])
-                
-                if st.button("Delete Pattern Label"):
-                    del labels['patterns'][pattern_to_delete]
-                    save_labels(labels)
-                    st.success(f"Deleted pattern label")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.info("No valid pattern labels to delete")
-    
-    # Preview labeled data
-    st.subheader("Preview With Labels Applied")
-    
-    try:
-        # Apply labels to the logs
-        labeled_logs = apply_labels_to_logs(logs_df)
-        
-        # Group by labeled app name
-        labeled_groups = labeled_logs.groupby('app_name').agg({
-            'duration': 'sum',
-            'original_app_name': 'first',  # Show original name
-            'timestamp': 'count'  # Count entries
-        }).reset_index()
-        
-        # Calculate percentage
-        total_time = labeled_logs['duration'].sum()
-        if total_time > 0:
-            labeled_groups['percentage'] = (labeled_groups['duration'] / total_time * 100).round(1)
-        else:
-            labeled_groups['percentage'] = 0
-        
-        # Sort by duration
-        labeled_groups = labeled_groups.sort_values('duration', ascending=False)
-        
-        # Display the grouped data
-        if not labeled_groups.empty:
-            st.dataframe({
-                "Labeled Activity": labeled_groups['app_name'],
-                "Original Name": labeled_groups['original_app_name'],
-                "Duration": labeled_groups['duration'].apply(lambda x: f"{x // 60} minutes"),
-                "Percentage": labeled_groups['percentage'].apply(lambda x: f"{x}%"),
-                "Log Entries": labeled_groups['timestamp']
-            }, use_container_width=True)
-            
-            # Create a pie chart of the labeled data
-            fig = px.pie(
-                labeled_groups,
-                values='duration',
-                names='app_name',
-                title="Preview of Labeled Activities",
-                hole=0.3
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No data available for preview")
-    except Exception as e:
-        st.error(f"Error generating preview: {e}")
-        st.info("Try labeling some activities first.")
-        
-    # ENHANCEMENT: Add Label Summary Table with improved styling and metrics
-    st.subheader("📊 Label Summary")
-    st.markdown("### Time Spent by Category")
+        st.info("No grouped window title activities for this date. You can still create Application or Pattern labels based on raw log data.")
 
-    try:
-        # Apply labels to get a full labeled dataset
-        labeled_data = apply_labels_to_logs(logs_df)
-        
-        # Get unique labels from all sources
-        all_labels = set()
-        
-        # From window titles
-        for label in labels.get('exact_titles', {}).values():
-            all_labels.add(label)
-            
-        # From applications
-        for label in labels.get('exact_exe', {}).values():
-            all_labels.add(label)
-            
-        # From patterns
-        for label in labels.get('patterns', {}).values():
-            all_labels.add(label)
-            
-        # Add unlabeled category
-        all_labels.add("Unlabeled")
-        
-        # Create summary table
-        label_summary = []
-        
-        for label_name in all_labels:
-            if label_name == "Unlabeled":
-                # For unlabeled, find entries where app_name == original_app_name
-                unlabeled_mask = labeled_data['app_name'] == labeled_data['original_app_name']
-                total_time = labeled_data.loc[unlabeled_mask, 'duration'].sum()
-                entry_count = unlabeled_mask.sum()
-            else:
-                # For labeled entries, find where app_name matches the label
-                label_mask = labeled_data['app_name'] == label_name
-                total_time = labeled_data.loc[label_mask, 'duration'].sum()
-                entry_count = label_mask.sum()
-            
-            # Skip empty labels
-            if total_time == 0:
-                continue
-                
-            # Calculate percentage
-            if labeled_data['duration'].sum() > 0:
-                percentage = (total_time / labeled_data['duration'].sum() * 100).round(1)
-            else:
-                percentage = 0
-                
-            label_summary.append({
-                "Label": label_name,
-                "Total Time (min)": total_time // 60,
-                "Total Time (hr)": round(total_time / 3600, 2),
-                "Percentage": percentage,
-                "Log Entries": entry_count
-            })
-            
-        # Convert to dataframe and sort
-        if label_summary:
-            summary_df = pd.DataFrame(label_summary)
-            summary_df = summary_df.sort_values("Total Time (min)", ascending=False)
-            
-            # Calculate grand total
-            grand_total_mins = summary_df["Total Time (min)"].sum()
-            grand_total_hrs = summary_df["Total Time (hr)"].sum()
-            
-            # Create metrics for a quick overview
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Tracked Time", f"{grand_total_mins} minutes")
-            with col2:
-                st.metric("Total Hours", f"{grand_total_hrs:.2f} hours")
-            with col3:
-                st.metric("Number of Labels", f"{len(summary_df) - ('Unlabeled' in summary_df['Label'].values)}")
-            
-            # Display as styled table with conditionally formatted bars for percentages
-            st.write("**Detailed Time Breakdown by Label:**")
-            
-            # Create a styled dataframe with a bar chart for percentages
-            styled_df = summary_df.style.bar(subset=['Percentage'], color='#5fba7d', vmax=100)
-            
-            st.dataframe(styled_df, use_container_width=True)
-            
-            # Create a pie chart of the label summary
-            fig = px.pie(
-                summary_df,
-                values="Total Time (min)",
-                names="Label",
-                title="Time Distribution by Label",
-                hole=0.3,
-                color_discrete_sequence=px.colors.qualitative.Bold
-            )
-            
-            # Improve the pie chart layout
-            fig.update_traces(textposition='inside', textinfo='percent+label')
-            fig.update_layout(
-                legend_title_text='Activity Labels',
-                height=500
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Add export options
-            st.download_button(
-                label="Download Summary as CSV",
-                data=summary_df.to_csv(index=False).encode('utf-8'),
-                file_name=f"label_summary_{selected_date}.csv",
-                mime="text/csv"
-            )
+    form_tab_title, form_tab_app, form_tab_pattern = st.tabs([
+        "Create: Label Specific Window Title", 
+        "Create: Label Application (by Basename)", 
+        "Create: Label by Pattern (App Basename + Title Pattern)"
+    ])
+
+    with form_tab_title: # Label by specific title (uses full EXE path from title_groups)
+        st.markdown("Labels specific `Window Title` + `Full Executable Path` from grouped activities above.")
+        if title_groups_for_labeling.empty:
+            st.warning("No grouped activities available to select specific titles.")
         else:
-            st.info("No labels have been applied yet. Create some labels to see a summary.")
-    except Exception as e:
-        st.error(f"Error generating label summary: {e}")
-        st.info("Try labeling some activities first.")
+            with st.form("form_specific_title_label"):
+                # Let user pick from title_groups
+                titles_available = title_groups_for_labeling['title'].tolist()
+                selected_titles = st.multiselect("Select Window Title(s) from grouped activities", options=titles_available, key="sel_spec_titles")
+                new_label_for_titles = st.text_input("Enter Label for selected title(s)", key="label_spec_titles")
+                submitted_spec_title = st.form_submit_button("Save Title Label(s)")
+                if submitted_spec_title and selected_titles and new_label_for_titles.strip():
+                    for title_to_label in selected_titles:
+                        # Find the full exe path associated with this title from title_groups
+                        exe_for_title = title_groups_for_labeling[title_groups_for_labeling['title'] == title_to_label]['exe'].iloc[0]
+                        label_key = f"exact::{exe_for_title}::{title_to_label}"
+                        current_labels['exact_titles'][label_key] = new_label_for_titles.strip()
+                    if save_labels(current_labels): st.success("Specific title label(s) saved!"); time.sleep(1); st.rerun()
+                elif submitted_spec_title: st.warning("Please select title(s) and enter a label.")
+    
+    with form_tab_app: # Label by app basename
+        st.markdown("Labels an entire application based on its `Executable Basename` (e.g., `chrome.exe`).")
+        if not all_exe_basenames_in_logs:
+            st.warning("No executable basenames found in logs for this date.")
+        else:
+            with st.form("form_app_basename_label"):
+                selected_app_basename = st.selectbox("Select Application Basename", options=all_exe_basenames_in_logs, key="sel_app_basename")
+                new_label_for_app = st.text_input(f"Enter Label for '{selected_app_basename}'", 
+                                                  value=current_labels['exact_exe'].get(selected_app_basename, ""), key="label_app_basename")
+                submitted_app_label = st.form_submit_button("Save Application Label")
+                if submitted_app_label:
+                    if new_label_for_app.strip():
+                        current_labels['exact_exe'][selected_app_basename] = new_label_for_app.strip()
+                    elif selected_app_basename in current_labels['exact_exe']: # If label cleared, remove it
+                        del current_labels['exact_exe'][selected_app_basename]
+                    if save_labels(current_labels): st.success("Application label updated!"); time.sleep(1); st.rerun()
+    
+    with form_tab_pattern: # Label by pattern (app basename + title pattern)
+        st.markdown("Labels activities matching an `App Basename` AND a `Window Title Pattern` (case-insensitive).")
+        if not all_exe_basenames_in_logs:
+            st.warning("No executable basenames found for pattern matching.")
+        else:
+            with st.form("form_pattern_label"):
+                selected_app_basename_patt = st.selectbox("Select Application Basename for Pattern", options=all_exe_basenames_in_logs, key="sel_app_basename_patt")
+                title_pattern_for_label = st.text_input("Enter Window Title Pattern (e.g., 'youtube', 'project x')", key="patt_title_input")
+                new_label_for_pattern = st.text_input("Enter Label for this pattern", key="label_patt_input")
+                submitted_pattern_label = st.form_submit_button("Save Pattern Label")
+                if submitted_pattern_label and selected_app_basename_patt and title_pattern_for_label.strip() and new_label_for_pattern.strip():
+                    label_key = f"pattern::{selected_app_basename_patt}::{title_pattern_for_label.strip()}"
+                    current_labels['patterns'][label_key] = new_label_for_pattern.strip()
+                    if save_labels(current_labels): st.success("Pattern label saved!"); time.sleep(1); st.rerun()
+                elif submitted_pattern_label: st.warning("Please select an app, enter a title pattern, and a label.")
+
+    st.subheader("Delete Labels")
+    del_ltab1, del_ltab2, del_ltab3 = st.tabs(["Delete Window Title Label", "Delete App Label", "Delete Pattern Label"])
+    with del_ltab1:
+        keys_to_del = list(current_labels.get('exact_titles', {}).keys())
+        if keys_to_del:
+            sel_key = st.selectbox("Select Specific Title Label to Delete", keys_to_del, 
+                                   format_func=lambda k: f"{k.split('::')[1].split(os.sep)[-1]} - '{k.split('::')[2][:30]}...' -> {current_labels['exact_titles'][k]}", 
+                                   key="del_sel_exact_title")
+            if st.button("Delete Selected Title Label", key="del_btn_exact_title"):
+                if sel_key in current_labels['exact_titles']: del current_labels['exact_titles'][sel_key]
+                if save_labels(current_labels): st.success("Label deleted."); time.sleep(1); st.rerun()
+        else: st.info("No specific title labels to delete.")
+    # ... (similar deletion UI for exact_exe and patterns) ...
+
+    st.subheader("Preview With Labels Applied")
+    if not logs_df_for_labeling.empty:
+        labeled_logs_preview = apply_labels_to_logs(logs_df_for_labeling.copy()) # Important: use a copy
+        if not labeled_logs_preview.empty and 'app_name' in labeled_logs_preview.columns:
+            preview_agg = labeled_logs_preview.groupby('app_name').agg(
+                total_duration_sec=('duration', 'sum'),
+                original_names=('original_app_name', lambda x: list(set(x))[:3]), # Show a few original names
+                log_entries=('timestamp', 'count') if 'timestamp' in labeled_logs_preview else ('duration', 'count')
+            ).reset_index().sort_values('total_duration_sec', ascending=False)
+            preview_agg['Total Duration (min)'] = (preview_agg['total_duration_sec'] / 60).round(1)
+            st.dataframe(preview_agg[['app_name', 'Total Duration (min)', 'log_entries', 'original_names']], use_container_width=True)
+            if not preview_agg.empty and preview_agg['total_duration_sec'].sum() > 0:
+                fig_preview = px.pie(preview_agg, values='total_duration_sec', names='app_name', title="Labeled Activity Preview", hole=0.3)
+                st.plotly_chart(fig_preview, use_container_width=True)
+    
+    st.subheader("📊 Overall Label Summary for Selected Date")
+    if not logs_df_for_labeling.empty:
+        labeled_logs_summary_data = apply_labels_to_logs(logs_df_for_labeling.copy())
+        if not labeled_logs_summary_data.empty and 'app_name' in labeled_logs_summary_data.columns:
+            # Group by the final 'app_name' which is the label itself or "Unlabeled" (original_app_name if no label matched)
+            # For "Unlabeled", we need to sum where app_name == original_app_name
+            
+            summary_list = []
+            # Labeled items
+            labeled_items = labeled_logs_summary_data[labeled_logs_summary_data['app_name'] != labeled_logs_summary_data['original_app_name']]
+            if not labeled_items.empty:
+                labeled_agg = labeled_items.groupby('app_name')['duration'].sum().reset_index()
+                for _, row in labeled_agg.iterrows():
+                    summary_list.append({'Label Category': row['app_name'], 'Total Time (sec)': row['duration']})
+            
+            # Unlabeled items
+            unlabeled_items = labeled_logs_summary_data[labeled_logs_summary_data['app_name'] == labeled_logs_summary_data['original_app_name']]
+            if not unlabeled_items.empty:
+                 # Could further group unlabeled by original_app_name if desired, or just sum all as "Unlabeled"
+                total_unlabeled_time = unlabeled_items['duration'].sum()
+                if total_unlabeled_time > 0:
+                     summary_list.append({'Label Category': 'Uncategorized (Original Names)', 'Total Time (sec)': total_unlabeled_time})
+
+            if summary_list:
+                df_label_summary = pd.DataFrame(summary_list).sort_values('Total Time (sec)', ascending=False)
+                df_label_summary['Total Time (min)'] = (df_label_summary['Total Time (sec)'] / 60).round(1)
+                df_label_summary['Percentage'] = (df_label_summary['Total Time (sec)'] / df_label_summary['Total Time (sec)'].sum() * 100).round(1)
+                st.dataframe(df_label_summary[['Label Category', 'Total Time (min)', 'Percentage']], use_container_width=True)
+                if df_label_summary['Total Time (sec)'].sum() > 0:
+                    fig_summary = px.pie(df_label_summary, values='Total Time (sec)', names='Label Category', title="Time Distribution by Label Category", hole=0.4)
+                    st.plotly_chart(fig_summary, use_container_width=True)
+            else:
+                st.info("No data to summarize by label for this date after applying labels.")
+
 
 # --- Dashboard Page ---
 def display_dashboard():
     st.title("📊 Focus Monitor Dashboard")
-    
     available_dates = load_available_dates()
-    if not available_dates:
-        st.error("No data found in focus_logs directory.")
-        st.warning("Focus monitor must be running to collect data.")
-        st.stop()
+    if not available_dates: st.error("No data found in focus_logs directory. Is the monitor running?"); st.stop()
+    selected_date = st.selectbox("Select a date to view", available_dates, key="dashboard_date_select")
     
-    selected_date = st.selectbox("Select a date", available_dates)
-    
-    # Load or generate summary
-    summary = load_daily_summary(selected_date)
-    if not summary:
-        st.warning(f"Could not load or generate summary for {selected_date}")
-        st.stop()
-    
-    # --- Summary Metrics ---
-    col1, col2, col3 = st.columns(3)
-    col1.metric("🕒 Total Focus Time", f"{summary['totalTime'] // 60} min")
-    if 'focusScore' in summary:
-        col2.metric("🎯 Focus Score", f"{summary['focusScore']} / 100")
-    if 'meetingTime' in summary:
-        col3.metric("📞 Meeting Time", f"{summary['meetingTime'] // 60} min")
-    
-    # --- Pie Chart ---
-    st.subheader("🧠 Time Distribution by Application")
-    app_data = summary["appBreakdown"]
-    if app_data:
-        # Create interactive chart with plotly
-        fig = create_pie_chart(app_data)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Show top apps in a table
-        app_df = pd.DataFrame([{
-            "Application": app["appName"],
-            "Time (minutes)": app["timeSpent"] // 60,
-            "Percentage": f"{app['percentage']:.1f}%"
-        } for app in app_data[:10]])  # Show top 10 apps
-        
-        st.dataframe(app_df, use_container_width=True)
-    else:
-        st.info("No application usage data available for this date.")
-    
-    # --- Browser Usage Section ---
-    st.subheader("🌐 Browser Usage Analysis")
-    browser_fig = create_browser_chart(app_data)
-    if browser_fig:
-        st.plotly_chart(browser_fig, use_container_width=True)
-        
-        # Create a filtered table for just browsers
-        browser_apps = [app for app in app_data if "msedge" in app["appName"].lower() 
-                        or "chrome" in app["appName"].lower() 
-                        or "firefox" in app["appName"].lower()]
-        
-        if browser_apps:
-            # Check if we have user-labeled browser sessions
-            has_labeled_sessions = any(" - " in app["appName"] for app in browser_apps)
-            
-            browser_df = pd.DataFrame([{
-                "Browser Session": app["appName"],
-                "Time (minutes)": app["timeSpent"] // 60,
-                "Percentage of Total": f"{app['percentage']:.1f}%"
-            } for app in browser_apps])
-            
-            st.dataframe(browser_df, use_container_width=True)
-            
-            st.info("💡 Pro tip: You can create custom labels for any activities using the Labeling tab above.")
-    else:
-        st.info("No browser usage detected for this date.")
-   
-    # --- Log Table ---
-    with st.expander("📄 Raw Focus Log"):
-        log_df = load_log_entries(selected_date)
-        if not log_df.empty:
-            # Convert timestamp to datetime and add friendly duration
-            log_df["timestamp"] = pd.to_datetime(log_df["timestamp"])
-            log_df["duration_min"] = (log_df["duration"] / 60).round(1)
-            
-            # Use app_name which includes profile info
-            display_df = log_df[["timestamp", "app_name", "title", "duration_min"]].rename(
-                columns={"timestamp": "Time", "app_name": "Application", "title": "Window Title", "duration_min": "Duration (min)"}
-            ).sort_values("Time", ascending=False)
-            
-            st.dataframe(display_df, use_container_width=True)
-        else:
-            st.info("No log entries available for this date.")
+    daily_summary_data = load_daily_summary(selected_date) # This now applies labels via generate_summary_from_logs
+    if not daily_summary_data: st.warning(f"Could not load or generate a summary for {selected_date}."); st.stop()
 
-    # --- Block Feedback Section ---
-    buckets = load_time_buckets(selected_date)
-    if buckets:
-        st.subheader("📝 Add Feedback for 5-Minute Blocks")
-        option_map = {b['start']: f"{b['start'][11:16]} UTC" for b in buckets}
-        selected_blocks = st.multiselect(
-            "Select block start times",
-            options=list(option_map.keys()),
-            format_func=lambda x: option_map[x]
-        )
-        feedback_text = st.text_area("Feedback")
-        if st.button("Submit Feedback"):
-            if selected_blocks and feedback_text.strip():
-                feedback = load_block_feedback()
-                for ts in selected_blocks:
-                    feedback[ts] = feedback_text.strip()
-                if save_block_feedback(feedback):
-                    st.success("Feedback saved")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.warning("Select block(s) and enter feedback text")
-        existing = load_block_feedback()
-        if existing:
-            st.markdown("#### Existing Feedback")
-            feedback_rows = [
-                {"Block Start": k, "Feedback": v}
-                for k, v in existing.items() if k in option_map
-            ]
-            if feedback_rows:
-                st.dataframe(pd.DataFrame(feedback_rows), use_container_width=True)
+    # --- Summary Metrics ---
+    d_col1, d_col2, d_col3 = st.columns(3)
+    d_col1.metric("🕒 Total Tracked Time", f"{daily_summary_data.get('totalTime', 0) // 60} min")
+    # Add Focus Score and Meeting Time if they are part of your daily_summary_data structure from standalone_focus_monitor.py
+    # For now, they are not in the simplified generate_summary_from_logs
     
-    # --- Additional Info ---
+    st.subheader("🧠 Time Distribution by Application/Activity (Post-Labeling)")
+    app_breakdown_data = daily_summary_data.get("appBreakdown", [])
+    if app_breakdown_data:
+        fig_pie_main = create_pie_chart(app_breakdown_data)
+        st.plotly_chart(fig_pie_main, use_container_width=True)
+        
+        df_app_top = pd.DataFrame([{
+            "Activity/Application": app.get("appName", "N/A"),
+            "Time (min)": app.get("timeSpent", 0) // 60,
+            "Percentage": f"{app.get('percentage', 0):.1f}%"
+        } for app in app_breakdown_data[:10]]) # Show top 10 labeled activities
+        st.dataframe(df_app_top, use_container_width=True)
+    else:
+        st.info("No application usage data available for this date in the summary.")
+    
+    st.subheader("🌐 Browser Usage Analysis (Labeled)")
+    fig_browser_main = create_browser_chart(app_breakdown_data) # Uses labeled appName
+    if fig_browser_main:
+        st.plotly_chart(fig_browser_main, use_container_width=True)
+    else:
+        st.info("No browser usage detected or included in the summary for this date.")
+   
+    with st.expander("📄 View Raw Focus Log Entries (Unlabeled Original Data)"):
+        raw_log_df = load_log_entries(selected_date) # Load raw, pre-labeling
+        if not raw_log_df.empty:
+            # Create a copy to avoid modifying the original DataFrame from cache
+            df_to_display = raw_log_df.copy()
+
+            # Define the desired final column names and their original sources
+            # Ensure 'timestamp' is the primary source for the 'Time' column
+            final_columns_map = {
+                "Time": "timestamp", # This will be formatted
+                "Original App Name": "app_name",
+                "Original Window Title": "title",
+                "Duration (s)": "duration"
+            }
+            
+            # Columns that must exist in raw_log_df for this section to work
+            required_raw_cols = ["timestamp", "app_name", "title", "duration"]
+            
+            if all(col in df_to_display.columns for col in required_raw_cols):
+                # Format the 'timestamp' to a readable 'Time' string IN A NEW COLUMN
+                df_to_display['Formatted Time'] = pd.to_datetime(df_to_display["timestamp"], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+
+                # Select and rename:
+                # Create a new DataFrame with only the columns we want, renaming them.
+                # This avoids duplicate column issues.
+                display_data = {}
+                if 'Formatted Time' in df_to_display.columns: # Check if conversion was successful
+                    display_data['Time'] = df_to_display['Formatted Time']
+                if 'app_name' in df_to_display.columns:
+                    display_data['Original App Name'] = df_to_display['app_name']
+                if 'title' in df_to_display.columns:
+                    display_data['Original Window Title'] = df_to_display['title']
+                if 'duration' in df_to_display.columns:
+                    display_data['Duration (s)'] = df_to_display['duration']
+
+                final_display_df = pd.DataFrame(display_data)
+
+                # Sort by the 'Time' column (which is now uniquely named and formatted)
+                if 'Time' in final_display_df.columns:
+                    final_display_df = final_display_df.sort_values("Time", ascending=False)
+                
+                st.dataframe(final_display_df, use_container_width=True, height=400)
+            else:
+                missing_cols = [col for col in required_raw_cols if col not in df_to_display.columns]
+                st.info(f"Essential columns missing in raw log for display: {', '.join(missing_cols)}")
+        else:
+            st.info("No raw log entries available for this date.")
+
+
+    # Simplified feedback view on dashboard - directs to Summaries tab
+    st.subheader("📝 Quick View: Recent Personal Notes for Blocks")
+    dashboard_personal_notes = load_block_feedback()
+    notes_for_selected_date = {k:v for k,v in dashboard_personal_notes.items() if k.startswith(selected_date)}
+    if notes_for_selected_date:
+        st.caption("Last 3 personal notes for this date (full management on '📝 Summaries' tab):")
+        for ts, note_text in list(notes_for_selected_date.items())[-3:]: # Show most recent 3
+             st.caption(f"_{pd.to_datetime(ts).strftime('%H:%M')}_: {note_text[:70]}{'...' if len(note_text) > 70 else ''}")
+    else:
+        st.info("No personal notes recorded for this date yet. Use the '📝 Summaries' tab to add notes and manage official summaries.")
+    
     st.markdown("---")
     st.markdown("""
     ### About Focus Monitor
     This dashboard displays data collected by the Focus Monitor agent. The agent tracks your active windows and applications to help you understand your computer usage patterns.
-    
-    **Activity Labeling**: You can now assign custom labels to any activities using the Labeling tab at the top of this page. This allows you to categorize your time in ways that are meaningful to you.
+    - **Labels**: Use the '🏷 Activity Label Editor' tab to categorize your time.
+    - **Summaries**: Use the '📝 Summaries' tab to review, note, and refine 5-minute block summaries.
     
     To generate data:
-    1. Make sure the Focus Monitor agent is running
-    2. Use your computer normally
-    3. Return to this dashboard to view your usage statistics
+    1. Ensure the Focus Monitor agent (`standalone_focus_monitor.py`) is running in the background.
+    2. Use your computer normally. Data is logged to the `focus_logs` directory.
+    3. Refresh this dashboard to view updated statistics and summaries.
     """)
+
 
 # --- Main App ---
 def main():
-    # Set page configuration
-    st.set_page_config(
-        page_title="Focus Monitor Dashboard",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-
-    # Removed sidebar tracker controls. Manually run the tracker using
-    # `python standalone_focus_monitor.py` before launching the dashboard.
+    st.set_page_config(page_title="Focus Monitor Dashboard", layout="wide", initial_sidebar_state="expanded")
     
-    # Create tabs for Dashboard, Label Editor and 5-Minute Summaries
-    tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🏷 Label Editor", "📝 Summaries"])
+    # Sidebar for tracker control (optional, can be removed if tracker is managed externally)
+    # st.sidebar.title("Tracker Control")
+    # if st.sidebar.button("Start Tracker", key="start_tracker_btn"):
+    #     start_tracker()
+    # if st.sidebar.button("Stop Tracker", key="stop_tracker_btn"):
+    #     stop_tracker()
+    # st.sidebar.caption(f"Tracker Running: {is_tracker_running()}")
+    # st.sidebar.markdown("---")
 
-    with tab1:
+
+    tab_dashboard, tab_label_editor, tab_summaries = st.tabs([
+        "📊 Dashboard", 
+        "🏷 Activity Label Editor", 
+        "📝 5-Min Summaries & Feedback"
+    ])
+
+    with tab_dashboard:
         display_dashboard()
-
-    with tab2:
+    with tab_label_editor:
         display_label_editor()
-
-    with tab3:
+    with tab_summaries:
         display_time_bucket_summaries()
 
 if __name__ == "__main__":
