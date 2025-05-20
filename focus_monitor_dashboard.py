@@ -14,6 +14,11 @@ import psutil
 import requests 
 from typing import Optional, Dict, Any, List, Tuple
 
+import json
+from pathlib import Path
+import requests
+from typing import Optional, Dict, Any, List
+
 # --- Configuration ---
 LOGS_DIR = Path(__file__).parent / "focus_logs"
 LABELS_FILE = LOGS_DIR / "activity_labels.json"
@@ -60,6 +65,249 @@ def stop_tracker():
         st.error(f"Failed to stop tracker: {e}")
     finally:
         st.session_state["tracker_pid"] = None
+
+def llm_test_page():
+    """A dedicated page for testing LLM category suggestions"""
+    st.title("🧪 LLM Category Suggestion Test Tool")
+    
+    # Check if categories exist
+    categories = load_categories()
+    if not categories:
+        st.error("No categories have been defined. Please create categories first.")
+        st.info("Go to the Activity Categories Manager tab to create categories.")
+        return
+    
+    st.write("This tool helps diagnose issues with category suggestions by directly testing the LLM's responses.")
+    
+    # Display current categories
+    with st.expander("View Current Categories"):
+        for cat in categories:
+            st.write(f"**{cat.get('name')}** ({cat.get('id')}): {cat.get('description')}")
+    
+    # Input area for test data
+    st.subheader("Test Data")
+    test_method = st.radio("Choose test method", ["Sample Titles", "Custom Titles", "Raw Log Data"], 
+                         help="Select how you want to provide test data")
+    
+    test_titles = []
+    
+    if test_method == "Sample Titles":
+        st.write("Using sample titles:")
+        sample_options = [
+            "Programming sample (VS Code, GitHub)",
+            "Meeting sample (Zoom, Calendar)",
+            "Web browsing sample (Chrome, browsing)",
+            "Gaming sample (Steam, game windows)"
+        ]
+        selected_sample = st.selectbox("Select a sample dataset", sample_options)
+        
+        if selected_sample == "Programming sample (VS Code, GitHub)":
+            test_titles = [
+                "VS Code - focus_monitor.py",
+                "GitHub - Issues - Focus Tracking",
+                "Stack Overflow - Python multithreading question"
+            ]
+        elif selected_sample == "Meeting sample (Zoom, Calendar)":
+            test_titles = [
+                "Zoom Meeting - Weekly Planning",
+                "Google Calendar - Meeting Schedule",
+                "Slack - #team-updates channel"
+            ]
+        elif selected_sample == "Web browsing sample (Chrome, browsing)":
+            test_titles = [
+                "Chrome - Reddit - r/programming",
+                "Chrome - YouTube - Python Tutorial",
+                "Chrome - Amazon - Shopping Cart"
+            ]
+        elif selected_sample == "Gaming sample (Steam, game windows)":
+            test_titles = [
+                "Steam - Library",
+                "EscapeFromTarkov",
+                "Discord - Gaming Server"
+            ]
+        
+        st.write("Window titles:")
+        for title in test_titles:
+            st.write(f"- {title}")
+            
+    elif test_method == "Custom Titles":
+        custom_titles = st.text_area("Enter window titles (one per line)",
+                                    placeholder="VS Code - my_project.py\nChrome - Google Search\nSlack - #general")
+        if custom_titles:
+            test_titles = [t.strip() for t in custom_titles.split("\n") if t.strip()]
+            
+    elif test_method == "Raw Log Data":
+        # Load available dates
+        available_dates = load_available_dates()
+        if not available_dates:
+            st.error("No log data found.")
+            return
+            
+        selected_date = st.selectbox("Select date", available_dates)
+        logs_df = load_log_entries(selected_date)
+        
+        if logs_df.empty:
+            st.error(f"No log entries found for {selected_date}")
+            return
+            
+        if 'title' not in logs_df.columns:
+            st.error("Log data doesn't contain window title information")
+            return
+            
+        # Show sample of log data
+        st.write("Sample of log data:")
+        st.dataframe(logs_df[['title', 'app_name']].head(10))
+        
+        # Get unique titles
+        unique_titles = logs_df['title'].dropna().unique().tolist()
+        test_titles = unique_titles[:10]  # Use first 10 unique titles
+        
+        st.write(f"Using {len(test_titles)} unique window titles from the logs")
+    
+    # Test button
+    if test_titles and st.button("Test LLM Category Suggestion", type="primary"):
+        with st.spinner("Sending request to LLM... This may take a few moments."):
+            # Generate the prompt
+            prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
+            prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in test_titles]) + "\n\n"
+            
+            prompt_text += "Based on the activity, please categorize it into ONE of the following categories:\n\n"
+            for cat in categories:
+                prompt_text += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
+                
+            prompt_text += "\nIf none of these categories fit well, you can suggest a new category instead."
+            prompt_text += "\n\nFirst, provide a concise summary of the activity."
+            prompt_text += "\nThen, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity, or 'none' if no categories fit well."
+            prompt_text += "\nIf you answered 'none', then on a new line after 'SUGGESTION:', provide a suggested new category name and short description in the format 'name | description'."
+            
+            # Show the full prompt
+            with st.expander("View full prompt sent to LLM"):
+                st.code(prompt_text)
+            
+            # Call LLM API
+            llm_response = _call_llm_api(prompt_text, "test category suggestion")
+            
+            # Display raw response
+            st.subheader("Raw LLM Response")
+            st.code(llm_response)
+            
+            # Process response
+            st.subheader("Processed Response")
+            
+            # Parse the response
+            try:
+                parts = llm_response.split("CATEGORY:")
+                if len(parts) < 2:
+                    st.error("❌ LLM did not include 'CATEGORY:' tag in response.")
+                    st.warning("The LLM should respond with a summary followed by 'CATEGORY:' tag.")
+                    return
+                
+                summary_text = parts[0].strip()
+                category_text = parts[1].strip()
+                
+                st.write("**Summary:**")
+                st.info(summary_text)
+                
+                # Get category ID (first word after CATEGORY:)
+                category_id = category_text.split()[0] if category_text.split() else ""
+                
+                # Check for suggestions
+                suggested_category = ""
+                if "SUGGESTION:" in category_text:
+                    suggestion_parts = category_text.split("SUGGESTION:")
+                    if len(suggestion_parts) > 1:
+                        category_text = suggestion_parts[0].strip()
+                        suggested_category = suggestion_parts[1].strip()
+                        
+                        # Update category_id
+                        category_id = category_text.split()[0] if category_text.split() else ""
+                
+                # Check if the category is "none"
+                if category_id.lower() == "none":
+                    st.write("**Category:** None (LLM suggests creating a new category)")
+                    category_id = ""
+                else:
+                    # Verify if category ID exists
+                    valid_cat_ids = [cat.get('id', '') for cat in categories]
+                    if category_id in valid_cat_ids:
+                        cat_name = next((cat.get('name', 'Unknown') for cat in categories if cat.get('id') == category_id), "Unknown")
+                        st.write(f"**Category:** {cat_name} ({category_id})")
+                        st.success("✅ Category ID is valid")
+                    else:
+                        st.error(f"❌ Invalid Category ID: '{category_id}'")
+                        st.warning("The category ID doesn't match any existing categories.")
+                
+                # Display suggestion if present
+                if suggested_category:
+                    st.write("**Suggested New Category:**")
+                    
+                    # Check format
+                    if "|" in suggested_category:
+                        name, desc = suggested_category.split("|", 1)
+                        st.info(f"Name: {name.strip()}")
+                        st.info(f"Description: {desc.strip()}")
+                        st.success("✅ Suggestion format is correct (contains name | description)")
+                        
+                        # Show how it would be added
+                        suggested_id = name.strip().lower().replace(" ", "_")
+                        st.write("Would be added as:")
+                        st.code(f"""{{
+  "id": "{suggested_id}",
+  "name": "{name.strip()}",
+  "description": "{desc.strip()}"
+}}""", language="json")
+                        
+                        # Option to add it
+                        if st.button("Add This Category Now"):
+                            # Create the new category
+                            new_category = {
+                                "id": suggested_id,
+                                "name": name.strip(),
+                                "description": desc.strip()
+                            }
+                            
+                            # Check if ID already exists
+                            existing_ids = [cat.get('id', '') for cat in categories]
+                            if suggested_id in existing_ids:
+                                st.error(f"A category with ID '{suggested_id}' already exists.")
+                            else:
+                                # Add it to categories
+                                categories.append(new_category)
+                                if save_categories(categories):
+                                    st.success(f"Created new category '{name.strip()}'!")
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to save the new category.")
+                    else:
+                        st.warning("⚠️ Suggestion format is incorrect (missing '|' separator)")
+                        st.info(f"Raw suggestion: {suggested_category}")
+                
+            except Exception as e:
+                st.error(f"Error processing LLM response: {e}")
+                st.info("This indicates a problem with the response format or parsing logic.")
+    
+    # Help section
+    with st.expander("Troubleshooting Tips"):
+        st.write("""
+        ### Troubleshooting LLM Category Suggestions
+        
+        If category suggestions aren't working correctly:
+        
+        1. **Check response format**: The LLM should respond with:
+           - A summary text
+           - A "CATEGORY:" tag followed by a category ID or "none"
+           - A "SUGGESTION:" tag (if "none" was given) with a new category name and description
+        
+        2. **Verify category IDs**: Make sure the LLM is using the exact category IDs you defined
+        
+        3. **Format issues**: The suggestion should use the format "name | description"
+        
+        4. **API connection**: Ensure your LLM API (Ollama) is running and accessible
+        
+        5. **Prompt clarity**: The prompt should clearly explain the format requirements
+        """)
+
 
 # --- Data Management Functions ---
 def load_available_dates():
@@ -303,7 +551,7 @@ def update_bucket_summary_in_file(session_tag: str, bucket_start_iso: str, new_s
     except Exception as e: st.error(f"Error updating official summary in {bucket_file_path.name}: {e}"); return False
 
 # --- Category Management Functions ---
-def load_categories() -> List[Dict[str, str]]:
+def load_categories():
     """Load user-defined activity categories from JSON file."""
     categories_file = Path(__file__).parent / "focus_logs" / "activity_categories.json"
     if not categories_file.exists():
@@ -315,7 +563,7 @@ def load_categories() -> List[Dict[str, str]]:
     except Exception as e:
         print(f"Error loading categories: {e}")
         return []
-
+    
 def save_categories(categories: List[Dict[str, str]]) -> bool:
     """Save user-defined activity categories to JSON file."""
     try:
@@ -353,76 +601,30 @@ def update_bucket_category_in_file(session_tag: str, bucket_start_iso: str, new_
         return False
 
 # --- LLM Interaction Functions ---
-def _call_llm_api(prompt: str, operation_name: str) -> Optional[str]:
+def _call_llm_api(prompt: str, operation_name: str = "LLM call") -> Optional[str]:
     """Generic LLM API call helper."""
-    LLM_API_URL = "http://localhost:11434/api/generate"  # Ollama API endpoint
-    LLM_MODEL = "llama3.1:8b"  # Specify your desired model
+    LLM_API_URL = "http://localhost:11434/api/generate"
+    LLM_MODEL = "llama3.1:8b"
     
     payload = {"model": LLM_MODEL, "prompt": prompt, "stream": False}
     try:
         print(f"Sending request to LLM ({LLM_MODEL}) for {operation_name}...")
-        response = requests.post(LLM_API_URL, json=payload, timeout=60) # Timeout of 60s
-        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        response = requests.post(LLM_API_URL, json=payload, timeout=60)
+        response.raise_for_status()
         data = response.json()
         llm_response_text = data.get("response", "").strip()
-        if not llm_response_text and prompt: # Warn if prompt was non-empty but response is
-             print(f"LLM returned an empty response for {operation_name}.")
-        print(f"LLM {operation_name} successful.")
+        if not llm_response_text and prompt:
+            print(f"LLM returned an empty response for {operation_name}.")
+        else:
+            print(f"LLM {operation_name} successful.")
         return llm_response_text
-    except requests.exceptions.Timeout: 
-        print(f"LLM API request timed out ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}.")
-    except requests.exceptions.RequestException as e: 
-        print(f"LLM API communication error ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}: {e}")
-    except Exception as e: 
+    except requests.exceptions.Timeout:
+        print(f"LLM API request timed out during {operation_name}.")
+    except requests.exceptions.RequestException as e:
+        print(f"LLM API communication error during {operation_name}: {e}")
+    except Exception as e:
         print(f"An unexpected error occurred during LLM {operation_name}: {e}")
     return None
-
-def categorize_new_time_bucket(bucket_data: Dict[str, Any], bucket_file_path: str, bucket_index: int) -> None:
-    """
-    Categorize a newly created time bucket using the LLM.
-    
-    Args:
-        bucket_data: The time bucket data that was just created
-        bucket_file_path: Path to the bucket file
-        bucket_index: Index of this bucket in the file
-    """
-    # Check if categories exist
-    categories = load_categories()
-    if not categories:
-        # No categories defined, nothing to do
-        return
-    
-    # Get the raw data from the bucket
-    bucket_titles = bucket_data.get("titles", [])
-    bucket_ocr_texts = bucket_data.get("ocr_text", [])
-    
-    # Skip if there's no data to categorize
-    if not bucket_titles and not bucket_ocr_texts:
-        return
-    
-    # Generate a summary and category
-    summary_text, category_id = generate_summary_from_raw_with_llm(bucket_titles, bucket_ocr_texts)
-    
-    # Update the bucket data with the summary and category
-    if summary_text:
-        bucket_data["summary"] = summary_text
-    if category_id:
-        bucket_data["category_id"] = category_id
-        
-    # Save the updated bucket back to the file
-    try:
-        with open(bucket_file_path, 'r', encoding='utf-8') as f:
-            all_buckets = json.load(f)
-        
-        # Update the bucket at the specified index
-        if 0 <= bucket_index < len(all_buckets):
-            all_buckets[bucket_index] = bucket_data
-            
-            with open(bucket_file_path, 'w', encoding='utf-8') as f:
-                json.dump(all_buckets, f, indent=2)
-    except Exception as e:
-        # Log error but don't crash the monitoring process
-        print(f"Error updating bucket with category: {e}")
 
 # --- Add these retroactive processing functions ---
 
@@ -582,10 +784,12 @@ def display_retroactive_processor():
                     
                     if summary:
                         # Use the summary to determine category
-                        _, category_id = refine_summary_with_llm(summary, "Please categorize this activity.", "")
+                        # Fix: Unpack 3 values instead of 2
+                        _, category_id, _ = refine_summary_with_llm(summary, "Please categorize this activity.", "")
                     elif raw_titles or raw_ocr:
                         # Generate new summary and category from raw data
-                        summary, category_id = generate_summary_from_raw_with_llm(raw_titles, raw_ocr)
+                        # Fix: Unpack 3 values instead of 2
+                        summary, category_id, _ = generate_summary_from_raw_with_llm(raw_titles, raw_ocr)
                     else:
                         # No data to categorize
                         category_id = ""
@@ -673,7 +877,8 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
             }
             
             # Generate summary and category with LLM
-            summary, category_id = generate_summary_from_raw_with_llm(titles, [])
+            # Fix: Unpack 3 values instead of 2
+            summary, category_id, _ = generate_summary_from_raw_with_llm(titles, [])
             if summary:
                 bucket["summary"] = summary
             if category_id:
@@ -695,20 +900,52 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
         st.error(f"Error saving time buckets: {e}")
         return False
 
-def generate_summary_from_raw_with_llm(bucket_titles, bucket_ocr_texts):
-    """Generate a summary and category from raw window titles and OCR text using LLM."""
+def process_activity_data(
+    bucket_titles: List[str], 
+    bucket_ocr_texts: List[str], 
+    allow_suggestions: bool = True,
+    update_bucket: bool = False,
+    bucket_data: Optional[Dict[str, Any]] = None,
+    bucket_file_path: Optional[str] = None,
+    bucket_index: Optional[int] = None
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Unified function to generate summaries/categories from activity data and optionally update bucket files.
+    
+    This function combines the functionality of generate_summary_from_raw_with_llm and categorize_new_time_bucket.
+    
+    Args:
+        bucket_titles: List of window titles
+        bucket_ocr_texts: List of OCR text snippets 
+        allow_suggestions: Whether to allow the LLM to suggest new categories
+        update_bucket: Whether to update a bucket file with the generated data
+        bucket_data: The bucket data to update (required if update_bucket=True)
+        bucket_file_path: Path to the bucket file (required if update_bucket=True)
+        bucket_index: Index of bucket in the file (required if update_bucket=True)
+        
+    Returns:
+        Tuple of (summary_text, category_id, suggested_category)
+    """
+    # Validate and clean inputs
     titles_to_send = [str(t) for t in bucket_titles if t and str(t).strip()] if bucket_titles else []
     ocr_to_send = [str(o) for o in bucket_ocr_texts if o and str(o).strip()] if bucket_ocr_texts else []
     
     text_parts = list(set(titles_to_send + ocr_to_send))  # Unique raw data points
     if not text_parts:
-        print("No raw titles or OCR text available in this bucket to generate a summary.")
-        return "", ""  # Return empty strings for summary and category
+        print("No raw titles or OCR text available to generate a summary")
+        return "", "", ""  # Return empty strings for summary, category, and suggestion
+    
+    # Check if update_bucket is True but required params are missing
+    if update_bucket and (bucket_data is None or bucket_file_path is None or bucket_index is None):
+        print("Warning: Cannot update bucket - missing required parameters")
+        update_bucket = False
     
     # Get available categories
     categories = load_categories()
     
+    # Build the prompt for the LLM
     prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
+    
     if titles_to_send:
         prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in titles_to_send]) + "\n\n"
     if ocr_to_send:
@@ -716,38 +953,233 @@ def generate_summary_from_raw_with_llm(bucket_titles, bucket_ocr_texts):
     
     # Add category classification if categories exist
     if categories:
-        prompt_text += "Based on the activity, please also categorize it into ONE of the following categories:\n\n"
+        prompt_text += "Based on the activity, please categorize it into ONE of the following categories:\n\n"
         for cat in categories:
             prompt_text += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
-        prompt_text += "\nFirst, provide a concise summary of the activity. Then, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity."
+            
+        if allow_suggestions:
+            prompt_text += "\nIf none of these categories fit well, you can suggest a new category instead."
+            prompt_text += "\n\nFirst, provide a concise summary of the activity."
+            prompt_text += "\nThen, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity, or 'none' if no categories fit well."
+            prompt_text += "\nIf you answered 'none', then on a new line after 'SUGGESTION:', provide a suggested new category name and short description in the format 'name | description'."
+        else:
+            prompt_text += "\nFirst, provide a concise summary of the activity. Then, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity."
+    else:
+        prompt_text += "Output only the summary text."
+    
+    # Call LLM API
+    llm_response = _call_llm_api(prompt_text, "activity processing")
+    
+    if not llm_response:
+        return "", "", ""
+    
+    # Parse response to extract summary, category, and suggestion
+    summary_text = llm_response
+    category_id = ""
+    suggested_category = ""
+    
+    if categories:
+        parts = llm_response.split("CATEGORY:")
+        if len(parts) > 1:
+            summary_text = parts[0].strip()
+            category_text = parts[1].strip()
+            
+            # Check for suggestion
+            suggestion_parts = category_text.split("SUGGESTION:")
+            if len(suggestion_parts) > 1:
+                category_text = suggestion_parts[0].strip()
+                suggested_category = suggestion_parts[1].strip()
+            
+            # Extract just the category ID (assuming it's the first word after "CATEGORY:")
+            category_id = category_text.split()[0] if category_text.split() else ""
+            
+            # Handle case where LLM says 'none'
+            if category_id.lower() == "none":
+                category_id = ""
+            else:
+                # Verify category ID exists
+                valid_cat_ids = [cat.get('id', '') for cat in categories]
+                if category_id not in valid_cat_ids:
+                    category_id = ""  # Reset if not valid
+    
+    # Update bucket if requested
+    if update_bucket and bucket_data is not None and bucket_file_path is not None and bucket_index is not None:
+        try:
+            # Update the bucket data
+            if summary_text:
+                bucket_data["summary"] = summary_text
+            if category_id:
+                bucket_data["category_id"] = category_id
+                
+            # Read the file
+            with open(bucket_file_path, 'r', encoding='utf-8') as f:
+                all_buckets = json.load(f)
+            
+            # Update the bucket at the specified index
+            if 0 <= bucket_index < len(all_buckets):
+                all_buckets[bucket_index] = bucket_data
+                
+                # Write back to the file
+                with open(bucket_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(all_buckets, f, indent=2)
+                print(f"Successfully updated bucket at index {bucket_index}")
+            else:
+                print(f"Error: bucket index {bucket_index} out of range (0-{len(all_buckets)-1})")
+        except Exception as e:
+            print(f"Error updating bucket: {e}")
+    
+    return summary_text, category_id, suggested_category
+
+def generate_summary_and_category(bucket_data):
+    """Generate a summary and category for the current bucket."""
+    bucket_titles = bucket_data.get("titles", [])
+    bucket_ocr_texts = bucket_data.get("ocr_text", [])
+    
+    # Skip processing if no data
+    if not bucket_titles and not bucket_ocr_texts:
+        return None, None
+    
+    # Load categories
+    categories = load_categories()
+    
+    # Prepare prompt
+    prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
+    if bucket_titles:
+        prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in bucket_titles]) + "\n\n"
+    if bucket_ocr_texts:
+        prompt_text += "Detected Text (OCR Snippets):\n" + "\n".join([f"- \"{o}\"" for o in bucket_ocr_texts]) + "\n\n"
+    
+    # Add category options if available
+    if categories:
+        prompt_text += "Based on the activity, please categorize it into ONE of the following categories:\n\n"
+        for cat in categories:
+            prompt_text += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
+        prompt_text += "\nFirst, provide a concise summary of the activity.\nThen, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity."
+    else:
+        prompt_text += "Output only the summary text."
+    
+    # Call LLM API
+    llm_response = _call_llm_api(prompt_text, "bucket summarization")
+    if not llm_response:
+        return None, None
+    
+    # Parse response
+    summary_text = llm_response
+    category_id = None
+    
+    if categories:
+        # Split on "CATEGORY:" if present
+        parts = llm_response.split("CATEGORY:")
+        if len(parts) > 1:
+            summary_text = parts[0].strip()
+            category_text = parts[1].strip()
+            
+            # Get first word as category ID
+            if category_text:
+                category_id = category_text.split()[0] if category_text.split() else None
+                
+                # Validate category ID
+                valid_ids = [cat.get('id', '') for cat in categories]
+                if category_id not in valid_ids:
+                    category_id = None  # Reset if invalid
+    
+    return summary_text, category_id
+
+def generate_summary_from_raw_with_llm(bucket_titles: List[str], bucket_ocr_texts: List[str], allow_suggestions: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Generate a summary, category, and optionally suggest a new category if needed.
+    
+    Args:
+        bucket_titles: List of window titles
+        bucket_ocr_texts: List of OCR text snippets
+        allow_suggestions: Whether to allow the LLM to suggest new categories
+        
+    Returns:
+        Tuple of (summary_text, category_id, suggested_category)
+    """
+    titles_to_send = [str(t) for t in bucket_titles if t and str(t).strip()] if bucket_titles else []
+    ocr_to_send = [str(o) for o in bucket_ocr_texts if o and str(o).strip()] if bucket_ocr_texts else []
+    
+    text_parts = list(set(titles_to_send + ocr_to_send))  # Unique raw data points
+    if not text_parts:
+        print("No raw titles or OCR text available in this bucket")
+        return "", "", ""  # Return empty strings for summary, category, and suggestion
+    
+    # Get available categories
+    categories = load_categories()
+    
+    prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
+    
+    if titles_to_send:
+        prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in titles_to_send]) + "\n\n"
+    if ocr_to_send:
+        prompt_text += "Detected Text (OCR Snippets):\n" + "\n".join([f"- \"{o}\"" for o in ocr_to_send]) + "\n\n"
+    
+    # Add category classification if categories exist
+    if categories:
+        prompt_text += "Based on the activity, please categorize it into ONE of the following categories:\n\n"
+        for cat in categories:
+            prompt_text += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
+            
+        if allow_suggestions:
+            prompt_text += "\nIf none of these categories fit well, you can suggest a new category instead."
+            prompt_text += "\n\nFirst, provide a concise summary of the activity."
+            prompt_text += "\nThen, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity, or 'none' if no categories fit well."
+            prompt_text += "\nIf you answered 'none', then on a new line after 'SUGGESTION:', provide a suggested new category name and short description in the format 'name | description'."
+        else:
+            prompt_text += "\nFirst, provide a concise summary of the activity. Then, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity."
     else:
         prompt_text += "Output only the summary text."
     
     llm_response = _call_llm_api(prompt_text, "raw data summarization")
     
     if not llm_response:
-        return "", ""
+        return "", "", ""
     
-    # Parse response to extract summary and category
+    # Parse response to extract summary, category, and suggestion
+    summary_text = llm_response
+    category_id = ""
+    suggested_category = ""
+    
     if categories:
         parts = llm_response.split("CATEGORY:")
         if len(parts) > 1:
             summary_text = parts[0].strip()
             category_text = parts[1].strip()
+            
+            # Check for suggestion
+            suggestion_parts = category_text.split("SUGGESTION:")
+            if len(suggestion_parts) > 1:
+                category_text = suggestion_parts[0].strip()
+                suggested_category = suggestion_parts[1].strip()
+            
             # Extract just the category ID (assuming it's the first word after "CATEGORY:")
             category_id = category_text.split()[0] if category_text.split() else ""
-            # Verify category ID exists
-            valid_cat_ids = [cat.get('id', '') for cat in categories]
-            if category_id not in valid_cat_ids:
-                category_id = ""  # Reset if not valid
-            return summary_text, category_id
-        else:
-            return llm_response, ""  # No category found, return whole response as summary
+            
+            # Handle case where LLM says 'none'
+            if category_id.lower() == "none":
+                category_id = ""
+            else:
+                # Verify category ID exists
+                valid_cat_ids = [cat.get('id', '') for cat in categories]
+                if category_id not in valid_cat_ids:
+                    category_id = ""  # Reset if not valid
     
-    return llm_response, ""  # No categories defined, return just the summary
+    return summary_text, category_id, suggested_category
 
-def refine_summary_with_llm(original_summary: str, user_feedback: str, current_category_id: str = "") -> Tuple[Optional[str], Optional[str]]:
-    """Refine an existing summary based on user feedback, preserving category if possible."""
+def refine_summary_with_llm(original_summary: str, user_feedback: str, current_category_id: str = "", allow_suggestions: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Refine an existing summary based on user feedback, preserving category if possible.
+    
+    Args:
+        original_summary: The current summary text
+        user_feedback: User's feedback or input
+        current_category_id: Current category ID (if any)
+        allow_suggestions: Whether to allow the LLM to suggest new categories
+        
+    Returns:
+        Tuple of (refined_summary, category_id, suggested_category)
+    """
     categories = load_categories()
     current_category_name = "Uncategorized"
     
@@ -772,32 +1204,52 @@ Focus on integrating the user's points accurately.
         prompt += "Available categories:\n"
         for cat in categories:
             prompt += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
-        prompt += "\nFirst, provide the updated summary. Then, on a new line after 'CATEGORY:', provide the category ID that best matches (either keep the current one or suggest a different one if appropriate)."
+            
+        if allow_suggestions:
+            prompt += "\nIf none of these categories fit well, you can suggest a new category instead."
+            prompt += "\n\nFirst, provide the updated summary."
+            prompt += f"\nThen, on a new line after 'CATEGORY:', provide the category ID that best matches (either keep '{current_category_id}' or suggest a different one if appropriate), or 'none' if no categories fit well."
+            prompt += "\nIf you answered 'none', then on a new line after 'SUGGESTION:', provide a suggested new category name and short description in the format 'name | description'."
+        else:
+            prompt += "\nFirst, provide the updated summary. Then, on a new line after 'CATEGORY:', provide the category ID that best matches (either keep the current one or suggest a different one if appropriate)."
     else:
         prompt += "\nOutput only the new summary text."
     
     llm_response = _call_llm_api(prompt, "refinement")
     
     if not llm_response:
-        return None, current_category_id  # Maintain current category if LLM fails
+        return None, current_category_id, ""  # Maintain current category if LLM fails
     
-    # Parse response to extract summary and category
+    # Parse response to extract summary, category, and suggestion
+    refined_summary = llm_response
+    category_id = current_category_id
+    suggested_category = ""
+    
     if categories:
         parts = llm_response.split("CATEGORY:")
         if len(parts) > 1:
-            summary_text = parts[0].strip()
+            refined_summary = parts[0].strip()
             category_text = parts[1].strip()
+            
+            # Check for suggestion
+            suggestion_parts = category_text.split("SUGGESTION:")
+            if len(suggestion_parts) > 1:
+                category_text = suggestion_parts[0].strip()
+                suggested_category = suggestion_parts[1].strip()
+            
             # Extract category ID
             category_id = category_text.split()[0] if category_text.split() else current_category_id
-            # Verify category ID exists
-            valid_cat_ids = [cat.get('id', '') for cat in categories]
-            if category_id not in valid_cat_ids:
-                category_id = current_category_id  # Keep current if invalid
-            return summary_text, category_id
-        else:
-            return llm_response, current_category_id  # No category found, keep current
+            
+            # Handle case where LLM says 'none'
+            if category_id.lower() == "none":
+                category_id = ""
+            else:
+                # Verify category ID exists
+                valid_cat_ids = [cat.get('id', '') for cat in categories]
+                if category_id not in valid_cat_ids and category_id != current_category_id:
+                    category_id = current_category_id  # Keep current if invalid
     
-    return llm_response, current_category_id
+    return refined_summary, category_id, suggested_category
 
 # --- Visualization Functions ---
 def create_pie_chart(app_data: List[Dict[str, Any]]) -> go.Figure:
@@ -1002,11 +1454,8 @@ def save_current_bucket():
         # Set the end time for the bucket
         current_bucket["end"] = datetime.now().isoformat()
         
-        # Generate summary and category with LLM
-        summary_text, category_id = generate_summary_from_raw_with_llm(
-            current_bucket["titles"], 
-            current_bucket["ocr_text"]
-        )
+        # Generate summary and category with simplified function
+        summary_text, category_id = generate_summary_and_category(current_bucket)
         
         # Add summary and category to bucket
         if summary_text:
@@ -1045,9 +1494,12 @@ def display_time_bucket_summaries():
         st.info(f"No 5-minute summary blocks found for {selected_date}.")
         return
 
+    # Add tab for uncategorized entries
+    show_uncategorized = st.checkbox("Show only uncategorized entries", value=False)
+    
     # Create category filter if categories exist
     category_filter = "All Categories"
-    if categories:
+    if categories and not show_uncategorized:
         category_options = ["All Categories", "Uncategorized"] + [cat.get('name', 'Unknown') for cat in categories]
         category_filter = st.selectbox("Filter by category", category_options, key="category_filter")
     
@@ -1071,6 +1523,11 @@ def display_time_bucket_summaries():
         cols = st.columns(len(cat_counts))
         for i, (cat_name, count) in enumerate(cat_counts.items()):
             cols[i].metric(cat_name, count)
+        
+        # Show warning if there are uncategorized entries
+        if cat_counts["Uncategorized"] > 0:
+            st.warning(f"You have {cat_counts['Uncategorized']} uncategorized entries. Use the checkbox above to focus on them.")
+        
         st.markdown("---")
 
     for idx, bucket_data in enumerate(official_buckets):
@@ -1092,8 +1549,11 @@ def display_time_bucket_summaries():
                             if cat.get('id') == current_category_id), "Uncategorized")
             current_category_name = cat_match
         
-        # Apply category filter
-        if category_filter != "All Categories":
+        # Apply category filter and uncategorized filter
+        if show_uncategorized:
+            if current_category_id:  # Skip categorized entries
+                continue
+        elif category_filter != "All Categories":
             if category_filter == "Uncategorized" and current_category_name != "Uncategorized":
                 continue
             elif category_filter != "Uncategorized" and current_category_name != category_filter:
@@ -1103,11 +1563,89 @@ def display_time_bucket_summaries():
         expander_title = f"{time_range_display}"
         if categories:
             expander_title += f" - [{current_category_name}]"
+            if not current_category_id:
+                expander_title += " ⚠️"  # Add warning icon for uncategorized
         
         with st.expander(expander_title):
             # Display category selection if categories exist
             if categories:
                 st.markdown("**Current Category:**")
+                
+                # Show suggestion UI if uncategorized
+                suggested_category_name = ""
+                suggested_category_desc = ""
+                
+                if not current_category_id:
+                    raw_titles = bucket_data.get("titles", [])
+                    raw_ocr = bucket_data.get("ocr_text", [])
+                    
+                    # Button to get suggestion
+                    if st.button("Get Category Suggestion", key=f"suggest_cat_btn_{idx}_{bucket_start_iso}"):
+                        with st.spinner("Asking LLM for category suggestion..."):
+                            _, _, suggestion = generate_summary_from_raw_with_llm(raw_titles, raw_ocr)
+                            if suggestion:
+                                try:
+                                    suggestion_parts = suggestion.split("|", 1)
+                                    suggested_category_name = suggestion_parts[0].strip()
+                                    suggested_category_desc = suggestion_parts[1].strip() if len(suggestion_parts) > 1 else ""
+                                    st.session_state[f"suggested_cat_name_{idx}_{bucket_start_iso}"] = suggested_category_name
+                                    st.session_state[f"suggested_cat_desc_{idx}_{bucket_start_iso}"] = suggested_category_desc
+                                except:
+                                    st.error("Couldn't parse the suggestion properly.")
+                
+                # Display suggestion if available
+                suggestion_key_name = f"suggested_cat_name_{idx}_{bucket_start_iso}"
+                suggestion_key_desc = f"suggested_cat_desc_{idx}_{bucket_start_iso}"
+                
+                if suggestion_key_name in st.session_state and st.session_state[suggestion_key_name]:
+                    suggested_category_name = st.session_state[suggestion_key_name]
+                    suggested_category_desc = st.session_state.get(suggestion_key_desc, "")
+                    
+                    st.info(f"**Suggested New Category:** {suggested_category_name}\n\n{suggested_category_desc}")
+                    
+                    # Add buttons to create this category and apply it
+                    col1, col2 = st.columns(2)
+                    
+                    if col1.button("Create & Apply This Category", key=f"create_apply_cat_btn_{idx}_{bucket_start_iso}"):
+                        # Generate a valid ID from the name
+                        suggested_id = suggested_category_name.lower().replace(" ", "_")
+                        
+                        # Check if this ID already exists
+                        existing_ids = [cat.get('id', '') for cat in categories]
+                        if suggested_id in existing_ids:
+                            st.error(f"A category with ID '{suggested_id}' already exists. Please edit it manually.")
+                        else:
+                            # Create the new category
+                            new_category = {
+                                "id": suggested_id,
+                                "name": suggested_category_name,
+                                "description": suggested_category_desc
+                            }
+                            
+                            # Add it to categories
+                            categories.append(new_category)
+                            if save_categories(categories):
+                                # Apply the new category to this bucket
+                                if update_bucket_category_in_file(session_tag, bucket_start_iso, suggested_id):
+                                    st.success(f"Created new category '{suggested_category_name}' and applied it!")
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to apply the new category to this bucket.")
+                            else:
+                                st.error("Failed to save the new category.")
+                    
+                    if col2.button("Discard Suggestion", key=f"discard_suggestion_btn_{idx}_{bucket_start_iso}"):
+                        # Clear suggestion from session state
+                        if suggestion_key_name in st.session_state:
+                            del st.session_state[suggestion_key_name]
+                        if suggestion_key_desc in st.session_state:
+                            del st.session_state[suggestion_key_desc]
+                        st.success("Suggestion discarded.")
+                        time.sleep(0.5)
+                        st.rerun()
+                
+                # Standard category selection
                 category_options = ["Uncategorized"] + [cat.get('name', 'Unknown') for cat in categories]
                 category_ids = [""] + [cat.get('id', '') for cat in categories]
                 
@@ -1141,7 +1679,7 @@ def display_time_bucket_summaries():
                             time.sleep(1)
                             st.rerun()
             
-            # Current summary display
+            # Show the rest of the bucket details (summary, notes, actions)
             st.markdown("**Current Official Summary (from log file):**")
             st.caption(current_official_summary_text or "_No official summary available for this block._")
             
@@ -1186,7 +1724,7 @@ def display_time_bucket_summaries():
             with official_summary_action_cols[1]:
                 if st.button("Refine LLM Summary", key=f"refine_llm_summary_btn_{idx}_{bucket_start_iso}", help="Uses the 'Current Official Summary' AND the text from 'Your Input Text' (as feedback) to ask the LLM to generate an improved summary. This new summary will replace the current one in the log file."):
                     if user_input_text.strip(): 
-                        refined_summary_text, refined_category_id = refine_summary_with_llm(
+                        refined_summary_text, refined_category_id, suggested_category = refine_summary_with_llm(
                             current_official_summary_text, 
                             user_input_text.strip(),
                             current_category_id
@@ -1195,27 +1733,76 @@ def display_time_bucket_summaries():
                             # Update summary
                             if update_bucket_summary_in_file(session_tag, bucket_start_iso, refined_summary_text):
                                 # Update category if it changed
+                                category_updated = False
                                 if refined_category_id != current_category_id:
-                                    update_bucket_category_in_file(session_tag, bucket_start_iso, refined_category_id)
-                                st.success("LLM summary refined and updated!"); time.sleep(1); st.rerun()
-                            else: st.error("Failed to save LLM-refined official summary.")
-                    else: st.warning("Please enter some feedback in the 'Your Input Text' area to help refine the summary.")
+                                    category_updated = update_bucket_category_in_file(session_tag, bucket_start_iso, refined_category_id)
+                                
+                                # Store suggestion if provided
+                                if suggested_category:
+                                    try:
+                                        suggestion_parts = suggested_category.split("|", 1)
+                                        suggested_category_name = suggestion_parts[0].strip()
+                                        suggested_category_desc = suggestion_parts[1].strip() if len(suggestion_parts) > 1 else ""
+                                        st.session_state[f"suggested_cat_name_{idx}_{bucket_start_iso}"] = suggested_category_name
+                                        st.session_state[f"suggested_cat_desc_{idx}_{bucket_start_iso}"] = suggested_category_desc
+                                    except:
+                                        pass  # Ignore parsing errors for suggestions
+                                
+                                success_msg = "LLM summary refined and updated!"
+                                if category_updated:
+                                    success_msg += " Category was also updated."
+                                if suggested_category:
+                                    success_msg += " A new category was suggested."
+                                
+                                st.success(success_msg)
+                                time.sleep(1)
+                                st.rerun()
+                            else: 
+                                st.error("Failed to save LLM-refined official summary.")
+                    else: 
+                        st.warning("Please enter some feedback in the 'Your Input Text' area to help refine the summary.")
 
             with official_summary_action_cols[2]:
                 if st.button("Re-Generate Original LLM Summary", key=f"regenerate_original_llm_summary_btn_{idx}_{bucket_start_iso}", help="Asks the LLM to create a brand new summary based on the raw window titles and OCR text recorded for this block. This will replace the 'Current Official Summary' in the log file."):
                     raw_titles_list = bucket_data.get("titles", [])
                     raw_ocr_list = bucket_data.get("ocr_text", [])
-                    regenerated_summary_text, regenerated_category_id = generate_summary_from_raw_with_llm(
+                    regenerated_summary_text, regenerated_category_id, suggested_category = generate_summary_from_raw_with_llm(
                         raw_titles_list, raw_ocr_list
                     )
                     if regenerated_summary_text is not None: 
                         # Update summary
                         if update_bucket_summary_in_file(session_tag, bucket_start_iso, regenerated_summary_text):
                             # Update category
+                            category_updated = False
                             if regenerated_category_id:
-                                update_bucket_category_in_file(session_tag, bucket_start_iso, regenerated_category_id)
-                            st.success("Original LLM summary re-generated and updated!"); time.sleep(1); st.rerun()
-                        else: st.error("Failed to save LLM re-generated official summary.")
+                                category_updated = update_bucket_category_in_file(session_tag, bucket_start_iso, regenerated_category_id)
+                            
+                            # Store suggestion if provided
+                            if suggested_category:
+                                try:
+                                    suggestion_parts = suggested_category.split("|", 1)
+                                    suggested_category_name = suggestion_parts[0].strip()
+                                    suggested_category_desc = suggestion_parts[1].strip() if len(suggestion_parts) > 1 else ""
+                                    st.session_state[f"suggested_cat_name_{idx}_{bucket_start_iso}"] = suggested_category_name
+                                    st.session_state[f"suggested_cat_desc_{idx}_{bucket_start_iso}"] = suggested_category_desc
+                                except:
+                                    pass  # Ignore parsing errors for suggestions
+                            
+                            success_msg = "Original LLM summary re-generated and updated!"
+                            if category_updated:
+                                success_msg += " Category was also updated."
+                            if suggested_category:
+                                success_msg += " A new category was suggested."
+                            
+                            st.success(success_msg)
+                            time.sleep(1)
+                            st.rerun()
+                        else: 
+                            st.error("Failed to save LLM re-generated official summary.")
+
+    # Display notice if all items are filtered out
+    if show_uncategorized and all(bucket.get("category_id", "") for bucket in official_buckets):
+        st.info("All entries for this date have been categorized! 🎉")
 
 # --- Label Editor Page ---
 def display_label_editor():
@@ -1557,13 +2144,14 @@ def display_dashboard():
 def main():
     st.set_page_config(page_title="Focus Monitor Dashboard", layout="wide", initial_sidebar_state="expanded")
     
-    # Add retroactive processor tab to the navigation
-    tab_dashboard, tab_label_editor, tab_summaries, tab_categories, tab_processor = st.tabs([
+    # Add a dedicated test page
+    tab_dashboard, tab_label_editor, tab_summaries, tab_categories, tab_processor, tab_test = st.tabs([
         "📊 Dashboard", 
         "🏷 Activity Label Editor", 
         "📝 5-Min Summaries & Feedback",
         "🏆 Activity Categories Manager",
-        "⏮️ Historical Processor"
+        "⏮️ Historical Processor",
+        "🧪 LLM Test"
     ])
 
     with tab_dashboard:
@@ -1576,6 +2164,8 @@ def main():
         display_category_manager()
     with tab_processor:
         display_retroactive_processor()
+    with tab_test:
+        llm_test_page()  # Add the new test page
 
 if __name__ == "__main__":
     main()
