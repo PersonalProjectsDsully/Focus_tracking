@@ -12,12 +12,13 @@ import subprocess
 import sys
 import psutil
 import requests 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # --- Configuration ---
 LOGS_DIR = Path(__file__).parent / "focus_logs"
 LABELS_FILE = LOGS_DIR / "activity_labels.json"
 FEEDBACK_FILE = LOGS_DIR / "block_feedback.json" # For personal notes
+CATEGORIES_FILE = LOGS_DIR / "activity_categories.json" # For user-defined categories
 
 LLM_API_URL = "http://localhost:11434/api/generate"  # Ollama API endpoint
 LLM_MODEL = "llama3.1:8b"  # Specify your desired model
@@ -301,30 +302,460 @@ def update_bucket_summary_in_file(session_tag: str, bucket_start_iso: str, new_s
         return True
     except Exception as e: st.error(f"Error updating official summary in {bucket_file_path.name}: {e}"); return False
 
+# --- Category Management Functions ---
+def load_categories() -> List[Dict[str, str]]:
+    """Load user-defined activity categories from JSON file."""
+    categories_file = Path(__file__).parent / "focus_logs" / "activity_categories.json"
+    if not categories_file.exists():
+        return []
+    try:
+        with open(categories_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get("categories", [])
+    except Exception as e:
+        print(f"Error loading categories: {e}")
+        return []
+
+def save_categories(categories: List[Dict[str, str]]) -> bool:
+    """Save user-defined activity categories to JSON file."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CATEGORIES_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"categories": categories}, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error saving categories: {e}")
+        return False
+
+def update_bucket_category_in_file(session_tag: str, bucket_start_iso: str, new_category_id: str) -> bool:
+    """Update the category_id field for a specific time bucket in its file."""
+    bucket_file_path = LOGS_DIR / f"time_buckets_{session_tag}.json"
+    if not bucket_file_path.exists():
+        st.error(f"Official summary file not found: {bucket_file_path.name}")
+        return False
+    try:
+        with open(bucket_file_path, "r", encoding="utf-8") as f:
+            all_buckets_data = json.load(f)
+        found_bucket = False
+        for bucket_data in all_buckets_data:
+            if bucket_data.get("start") == bucket_start_iso:
+                bucket_data["category_id"] = new_category_id
+                found_bucket = True
+                break
+        if not found_bucket:
+            st.error(f"Bucket {bucket_start_iso} not found in {bucket_file_path.name}")
+            return False
+        with open(bucket_file_path, "w", encoding="utf-8") as f:
+            json.dump(all_buckets_data, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error updating bucket category in {bucket_file_path.name}: {e}")
+        return False
+
 # --- LLM Interaction Functions ---
 def _call_llm_api(prompt: str, operation_name: str) -> Optional[str]:
     """Generic LLM API call helper."""
+    LLM_API_URL = "http://localhost:11434/api/generate"  # Ollama API endpoint
+    LLM_MODEL = "llama3.1:8b"  # Specify your desired model
+    
     payload = {"model": LLM_MODEL, "prompt": prompt, "stream": False}
     try:
-        st.info(f"Sending request to LLM ({LLM_MODEL}) for {operation_name}...")
+        print(f"Sending request to LLM ({LLM_MODEL}) for {operation_name}...")
         response = requests.post(LLM_API_URL, json=payload, timeout=60) # Timeout of 60s
         response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
         data = response.json()
         llm_response_text = data.get("response", "").strip()
         if not llm_response_text and prompt: # Warn if prompt was non-empty but response is
-             st.warning(f"LLM returned an empty response for {operation_name}.")
-        st.success(f"LLM {operation_name} successful.")
+             print(f"LLM returned an empty response for {operation_name}.")
+        print(f"LLM {operation_name} successful.")
         return llm_response_text
     except requests.exceptions.Timeout: 
-        st.error(f"LLM API request timed out ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}.")
+        print(f"LLM API request timed out ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}.")
     except requests.exceptions.RequestException as e: 
-        st.error(f"LLM API communication error ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}: {e}")
+        print(f"LLM API communication error ({LLM_MODEL} at {LLM_API_URL}) during {operation_name}: {e}")
     except Exception as e: 
-        st.error(f"An unexpected error occurred during LLM {operation_name}: {e}")
+        print(f"An unexpected error occurred during LLM {operation_name}: {e}")
     return None
 
+def categorize_new_time_bucket(bucket_data: Dict[str, Any], bucket_file_path: str, bucket_index: int) -> None:
+    """
+    Categorize a newly created time bucket using the LLM.
+    
+    Args:
+        bucket_data: The time bucket data that was just created
+        bucket_file_path: Path to the bucket file
+        bucket_index: Index of this bucket in the file
+    """
+    # Check if categories exist
+    categories = load_categories()
+    if not categories:
+        # No categories defined, nothing to do
+        return
+    
+    # Get the raw data from the bucket
+    bucket_titles = bucket_data.get("titles", [])
+    bucket_ocr_texts = bucket_data.get("ocr_text", [])
+    
+    # Skip if there's no data to categorize
+    if not bucket_titles and not bucket_ocr_texts:
+        return
+    
+    # Generate a summary and category
+    summary_text, category_id = generate_summary_from_raw_with_llm(bucket_titles, bucket_ocr_texts)
+    
+    # Update the bucket data with the summary and category
+    if summary_text:
+        bucket_data["summary"] = summary_text
+    if category_id:
+        bucket_data["category_id"] = category_id
+        
+    # Save the updated bucket back to the file
+    try:
+        with open(bucket_file_path, 'r', encoding='utf-8') as f:
+            all_buckets = json.load(f)
+        
+        # Update the bucket at the specified index
+        if 0 <= bucket_index < len(all_buckets):
+            all_buckets[bucket_index] = bucket_data
+            
+            with open(bucket_file_path, 'w', encoding='utf-8') as f:
+                json.dump(all_buckets, f, indent=2)
+    except Exception as e:
+        # Log error but don't crash the monitoring process
+        print(f"Error updating bucket with category: {e}")
 
-def refine_summary_with_llm(original_summary: str, user_feedback: str) -> Optional[str]:
+# --- Add these retroactive processing functions ---
+
+def display_retroactive_processor():
+    """Tab for retroactively processing historical focus logs."""
+    st.title("⏮️ Historical Data Processor")
+    
+    # Check available dates with raw logs
+    all_dates = load_available_dates()
+    
+    # Find dates with logs but missing time buckets or summaries
+    incomplete_dates = []
+    
+    for date_str in all_dates:
+        log_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
+        summary_path = LOGS_DIR / f"daily_summary_{date_str}.json"
+        
+        # Check if time buckets exist for this date
+        time_buckets = load_time_buckets_for_date(date_str)
+        
+        if log_path.exists() and (not summary_path.exists() or not time_buckets):
+            incomplete_dates.append({
+                "date": date_str,
+                "has_summary": summary_path.exists(),
+                "has_buckets": bool(time_buckets),
+                "bucket_count": len(time_buckets) if time_buckets else 0
+            })
+    
+    if not incomplete_dates:
+        st.success("All focus logs have been processed! No historical data needs processing.")
+        st.info("If you've just added categories and want to apply them to existing time buckets, use the 'Recategorize Existing Data' section below.")
+    else:
+        st.warning(f"Found {len(incomplete_dates)} dates with focus logs that need processing.")
+        
+        # Display dates needing processing
+        df_incomplete = pd.DataFrame(incomplete_dates)
+        st.dataframe(df_incomplete, use_container_width=True)
+        
+        # Process selected date
+        selected_date = st.selectbox(
+            "Select a date to process", 
+            options=[d["date"] for d in incomplete_dates],
+            key="retroactive_date_select"
+        )
+        
+        selected_info = next((d for d in incomplete_dates if d["date"] == selected_date), None)
+        
+        if selected_info:
+            col1, col2 = st.columns(2)
+            
+            # Generate summary if needed
+            if not selected_info["has_summary"]:
+                if col1.button("Generate Daily Summary", key="gen_daily_summary_btn"):
+                    with st.spinner(f"Generating daily summary for {selected_date}..."):
+                        summary = generate_summary_from_logs(selected_date)
+                        if summary:
+                            # Save summary
+                            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                            summary_path = LOGS_DIR / f"daily_summary_{selected_date}.json"
+                            with open(summary_path, "w", encoding="utf-8") as f:
+                                json.dump(summary, f, indent=2)
+                            st.success(f"Daily summary for {selected_date} generated and saved!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to generate summary for {selected_date}")
+            
+            # Generate time buckets if needed
+            if not selected_info["has_buckets"] or selected_info["bucket_count"] == 0:
+                if col2.button("Generate Time Buckets", key="gen_time_buckets_btn"):
+                    with st.spinner(f"Generating time buckets for {selected_date}..."):
+                        success = generate_time_buckets_from_logs(selected_date)
+                        if success:
+                            st.success(f"Time buckets for {selected_date} generated and saved!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to generate time buckets for {selected_date}")
+    
+    # Section for recategorizing existing time buckets
+    st.markdown("---")
+    st.subheader("Recategorize Existing Data")
+    st.info("This will apply your current categories to existing time buckets using the LLM.")
+    
+    # Get all dates with time buckets
+    dates_with_buckets = []
+    for date_str in all_dates:
+        buckets = load_time_buckets_for_date(date_str)
+        if buckets:
+            # Count buckets with and without categories
+            with_category = sum(1 for b in buckets if b.get("category_id", ""))
+            total_buckets = len(buckets)
+            
+            dates_with_buckets.append({
+                "date": date_str,
+                "total_buckets": total_buckets,
+                "categorized_buckets": with_category,
+                "needs_categorization": with_category < total_buckets
+            })
+    
+    if not dates_with_buckets:
+        st.warning("No time bucket data found.")
+    else:
+        # Display dates with their categorization status
+        df_dates = pd.DataFrame(dates_with_buckets)
+        df_dates["Categorization %"] = (df_dates["categorized_buckets"] / df_dates["total_buckets"] * 100).round(1)
+        st.dataframe(df_dates, use_container_width=True)
+        
+        # Select date to recategorize
+        recategorize_date = st.selectbox(
+            "Select a date to recategorize", 
+            options=[d["date"] for d in dates_with_buckets],
+            key="recategorize_date_select"
+        )
+        
+        # Get buckets for the selected date
+        buckets_to_recategorize = load_time_buckets_for_date(recategorize_date)
+        
+        # Count uncategorized buckets
+        uncategorized_count = sum(1 for b in buckets_to_recategorize if not b.get("category_id", ""))
+        
+        # Options for recategorization
+        recategorize_all = st.checkbox("Recategorize all buckets (even those already categorized)", value=False)
+        
+        if st.button("Apply Categories to Time Buckets", key="apply_categories_btn"):
+            # Load categories
+            categories = load_categories()
+            if not categories:
+                st.error("No categories defined. Please create categories first.")
+            else:
+                bucket_count = len(buckets_to_recategorize)
+                
+                # Create progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                processed = 0
+                success_count = 0
+                
+                # Process each bucket
+                for bucket in buckets_to_recategorize:
+                    # Skip already categorized buckets unless recategorize_all is checked
+                    if bucket.get("category_id", "") and not recategorize_all:
+                        processed += 1
+                        progress_bar.progress(processed / bucket_count)
+                        continue
+                    
+                    bucket_start_iso = bucket.get("start", "")
+                    session_tag = bucket.get("session_tag", "")
+                    
+                    status_text.text(f"Processing bucket {processed+1}/{bucket_count}: {bucket_start_iso}")
+                    
+                    # Get summary and raw data
+                    summary = bucket.get("summary", "")
+                    raw_titles = bucket.get("titles", [])
+                    raw_ocr = bucket.get("ocr_text", [])
+                    
+                    if summary:
+                        # Use the summary to determine category
+                        _, category_id = refine_summary_with_llm(summary, "Please categorize this activity.", "")
+                    elif raw_titles or raw_ocr:
+                        # Generate new summary and category from raw data
+                        summary, category_id = generate_summary_from_raw_with_llm(raw_titles, raw_ocr)
+                    else:
+                        # No data to categorize
+                        category_id = ""
+                    
+                    if category_id:
+                        # Update category in the file
+                        if update_bucket_category_in_file(session_tag, bucket_start_iso, category_id):
+                            success_count += 1
+                    
+                    processed += 1
+                    progress_bar.progress(processed / bucket_count)
+                
+                if success_count > 0:
+                    st.success(f"Successfully categorized {success_count} buckets for {recategorize_date}!")
+                else:
+                    st.warning("No buckets were categorized. They may already have categories or lack data.")
+                
+                time.sleep(1)
+                st.rerun()
+
+def generate_time_buckets_from_logs(date_str: str) -> bool:
+    """Generate time buckets from focus logs for a specific date."""
+    log_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
+    if not log_path.exists():
+        st.error(f"Focus log for {date_str} not found.")
+        return False
+    
+    # Load raw logs
+    logs_df = load_log_entries(date_str)
+    if logs_df.empty:
+        st.error(f"No log entries found for {date_str}.")
+        return False
+    
+    # Ensure timestamp column exists and convert to datetime
+    if 'timestamp' not in logs_df.columns:
+        st.error("Log data missing timestamp column.")
+        return False
+    
+    logs_df['timestamp'] = pd.to_datetime(logs_df['timestamp'])
+    
+    # Sort by timestamp
+    logs_df = logs_df.sort_values('timestamp')
+    
+    # Get min and max timestamp for the day
+    min_time = logs_df['timestamp'].min()
+    max_time = logs_df['timestamp'].max()
+    
+    # Create 5-minute buckets
+    bucket_size = pd.Timedelta(minutes=5)
+    
+    # Generate bucket start times (floor to 5-minute intervals)
+    start_time = min_time.floor('5min')
+    end_time = max_time.ceil('5min')
+    
+    bucket_starts = []
+    current = start_time
+    while current <= end_time:
+        bucket_starts.append(current)
+        current += bucket_size
+    
+    # Create empty buckets
+    buckets = []
+    session_tag = datetime.now().strftime('%Y%m%dT%H%M%SZ')  # Unique session tag
+    
+    for i in range(len(bucket_starts) - 1):
+        bucket_start = bucket_starts[i]
+        bucket_end = bucket_starts[i + 1]
+        
+        # Filter logs for this bucket
+        bucket_logs = logs_df[(logs_df['timestamp'] >= bucket_start) & 
+                             (logs_df['timestamp'] < bucket_end)]
+        
+        if not bucket_logs.empty:
+            # Collect window titles
+            titles = []
+            if 'title' in bucket_logs.columns:
+                titles = bucket_logs['title'].dropna().unique().tolist()
+            
+            # Create bucket
+            bucket = {
+                "start": bucket_start.isoformat(),
+                "end": bucket_end.isoformat(),
+                "titles": titles,
+                "ocr_text": []  # Empty as historical logs might not have OCR
+            }
+            
+            # Generate summary and category with LLM
+            summary, category_id = generate_summary_from_raw_with_llm(titles, [])
+            if summary:
+                bucket["summary"] = summary
+            if category_id:
+                bucket["category_id"] = category_id
+                
+            buckets.append(bucket)
+    
+    if not buckets:
+        st.warning(f"No activity buckets created for {date_str}.")
+        return False
+    
+    # Save buckets to file
+    bucket_file_path = LOGS_DIR / f"time_buckets_{session_tag}.json"
+    try:
+        with open(bucket_file_path, 'w', encoding='utf-8') as f:
+            json.dump(buckets, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Error saving time buckets: {e}")
+        return False
+
+def generate_summary_from_raw_with_llm(bucket_titles, bucket_ocr_texts):
+    """Generate a summary and category from raw window titles and OCR text using LLM."""
+    titles_to_send = [str(t) for t in bucket_titles if t and str(t).strip()] if bucket_titles else []
+    ocr_to_send = [str(o) for o in bucket_ocr_texts if o and str(o).strip()] if bucket_ocr_texts else []
+    
+    text_parts = list(set(titles_to_send + ocr_to_send))  # Unique raw data points
+    if not text_parts:
+        print("No raw titles or OCR text available in this bucket to generate a summary.")
+        return "", ""  # Return empty strings for summary and category
+    
+    # Get available categories
+    categories = load_categories()
+    
+    prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
+    if titles_to_send:
+        prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in titles_to_send]) + "\n\n"
+    if ocr_to_send:
+        prompt_text += "Detected Text (OCR Snippets):\n" + "\n".join([f"- \"{o}\"" for o in ocr_to_send]) + "\n\n"
+    
+    # Add category classification if categories exist
+    if categories:
+        prompt_text += "Based on the activity, please also categorize it into ONE of the following categories:\n\n"
+        for cat in categories:
+            prompt_text += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
+        prompt_text += "\nFirst, provide a concise summary of the activity. Then, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity."
+    else:
+        prompt_text += "Output only the summary text."
+    
+    llm_response = _call_llm_api(prompt_text, "raw data summarization")
+    
+    if not llm_response:
+        return "", ""
+    
+    # Parse response to extract summary and category
+    if categories:
+        parts = llm_response.split("CATEGORY:")
+        if len(parts) > 1:
+            summary_text = parts[0].strip()
+            category_text = parts[1].strip()
+            # Extract just the category ID (assuming it's the first word after "CATEGORY:")
+            category_id = category_text.split()[0] if category_text.split() else ""
+            # Verify category ID exists
+            valid_cat_ids = [cat.get('id', '') for cat in categories]
+            if category_id not in valid_cat_ids:
+                category_id = ""  # Reset if not valid
+            return summary_text, category_id
+        else:
+            return llm_response, ""  # No category found, return whole response as summary
+    
+    return llm_response, ""  # No categories defined, return just the summary
+
+def refine_summary_with_llm(original_summary: str, user_feedback: str, current_category_id: str = "") -> Tuple[Optional[str], Optional[str]]:
+    """Refine an existing summary based on user feedback, preserving category if possible."""
+    categories = load_categories()
+    current_category_name = "Uncategorized"
+    
+    if current_category_id:
+        cat_match = next((cat.get('name', 'Unknown') for cat in categories 
+                        if cat.get('id') == current_category_id), "Uncategorized")
+        current_category_name = cat_match
+    
     prompt = f"""Current summary of activity:
 "{original_summary}"
 
@@ -334,27 +765,39 @@ User's feedback or additional details:
 Based on the current summary and the user's input, please provide an improved and concise summary.
 If the user's input suggests a complete rewrite, then generate that new summary.
 Focus on integrating the user's points accurately.
-Output only the new summary text.
 """
-    return _call_llm_api(prompt, "refinement")
 
-def generate_summary_from_raw_with_llm(bucket_titles: List[str], bucket_ocr_texts: List[str]) -> Optional[str]:
-    titles_to_send = [str(t) for t in bucket_titles if t and str(t).strip()] if bucket_titles else []
-    ocr_to_send = [str(o) for o in bucket_ocr_texts if o and str(o).strip()] if bucket_ocr_texts else []
+    if categories:
+        prompt += f"\nThe current activity is categorized as: {current_category_name} ({current_category_id})\n\n"
+        prompt += "Available categories:\n"
+        for cat in categories:
+            prompt += f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
+        prompt += "\nFirst, provide the updated summary. Then, on a new line after 'CATEGORY:', provide the category ID that best matches (either keep the current one or suggest a different one if appropriate)."
+    else:
+        prompt += "\nOutput only the new summary text."
     
-    text_parts = list(set(titles_to_send + ocr_to_send)) # Unique raw data points
-    if not text_parts:
-        st.info("No raw titles or OCR text available in this bucket to generate a summary.")
-        return "" # Return empty string to signify no summary could be made from raw
-
-    prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
-    if titles_to_send:
-        prompt_text += "Window Titles:\n" + "\n".join([f"- \"{t}\"" for t in titles_to_send]) + "\n\n"
-    if ocr_to_send:
-        prompt_text += "Detected Text (OCR Snippets):\n" + "\n".join([f"- \"{o}\"" for o in ocr_to_send]) + "\n\n"
-    prompt_text += "Output only the summary text."
-    return _call_llm_api(prompt_text, "raw data summarization")
-
+    llm_response = _call_llm_api(prompt, "refinement")
+    
+    if not llm_response:
+        return None, current_category_id  # Maintain current category if LLM fails
+    
+    # Parse response to extract summary and category
+    if categories:
+        parts = llm_response.split("CATEGORY:")
+        if len(parts) > 1:
+            summary_text = parts[0].strip()
+            category_text = parts[1].strip()
+            # Extract category ID
+            category_id = category_text.split()[0] if category_text.split() else current_category_id
+            # Verify category ID exists
+            valid_cat_ids = [cat.get('id', '') for cat in categories]
+            if category_id not in valid_cat_ids:
+                category_id = current_category_id  # Keep current if invalid
+            return summary_text, category_id
+        else:
+            return llm_response, current_category_id  # No category found, keep current
+    
+    return llm_response, current_category_id
 
 # --- Visualization Functions ---
 def create_pie_chart(app_data: List[Dict[str, Any]]) -> go.Figure:
@@ -408,18 +851,227 @@ def create_browser_chart(app_data: List[Dict[str, Any]]) -> Optional[go.Figure]:
     fig.update_traces(textposition='outside')
     return fig
 
+def create_category_chart(buckets: List[Dict[str, Any]], categories: List[Dict[str, str]]) -> Optional[go.Figure]:
+    """Create a pie chart showing time distribution by category."""
+    if not buckets or not categories:
+        return None
+    
+    # Create a mapping of category ID to name
+    cat_id_to_name = {cat.get('id', ''): cat.get('name', 'Unknown') for cat in categories}
+    
+    # Count time per category
+    category_times = {"Uncategorized": 0}
+    for bucket in buckets:
+        cat_id = bucket.get('category_id', '')
+        cat_name = cat_id_to_name.get(cat_id, 'Uncategorized') if cat_id else 'Uncategorized'
+        
+        # Calculate duration
+        start_time = pd.to_datetime(bucket.get('start', ''))
+        end_time = pd.to_datetime(bucket.get('end', bucket.get('start', '')))
+        if start_time and end_time:
+            duration = (end_time - start_time).total_seconds()
+            category_times[cat_name] = category_times.get(cat_name, 0) + duration
+    
+    # Remove categories with zero time
+    category_times = {k: v for k, v in category_times.items() if v > 0}
+    
+    if not category_times:
+        return None
+    
+    # Create data for the chart
+    labels = [f"{cat} ({int(time//60)}m)" for cat, time in category_times.items()]
+    values = list(category_times.values())
+    
+    fig = go.Figure()
+    fig.add_trace(go.Pie(
+        labels=labels, 
+        values=values, 
+        hole=0.4, 
+        textinfo='percent+label', 
+        textfont_size=12
+    ))
+    fig.update_layout(
+        title_text="Time Distribution by Category",
+        height=450
+    )
+    return fig
+
+# --- Activity Categories Manager Page ---
+def display_category_manager():
+    st.title("🏆 Activity Categories Manager")
+    
+    # Load existing categories
+    categories = load_categories()
+    
+    # Display existing categories
+    if categories:
+        st.subheader("Current Categories")
+        for i, category in enumerate(categories):
+            with st.expander(f"{category.get('name', 'Unnamed Category')}"):
+                st.write(f"**ID:** {category.get('id', '')}")
+                st.write(f"**Description:** {category.get('description', '')}")
+    else:
+        st.info("No categories defined yet. Use the form below to create categories.")
+    
+    # Add new category form
+    st.subheader("Add New Category")
+    with st.form("add_category_form"):
+        cat_name = st.text_input("Category Name", placeholder="e.g., Coding, Meetings, Research")
+        cat_id = st.text_input("Category ID (lowercase, no spaces)", 
+                              value="" if not cat_name else cat_name.lower().replace(" ", "_"),
+                              placeholder="e.g., coding, meetings, research")
+        cat_desc = st.text_area("Category Description", 
+                               placeholder="Describe what activities fall under this category...",
+                               help="Provide details to help the LLM correctly categorize activities")
+        submitted = st.form_submit_button("Add Category")
+        
+        if submitted:
+            if not cat_name or not cat_id or not cat_desc:
+                st.warning("All fields are required")
+            else:
+                # Check for duplicate IDs
+                if any(cat.get('id') == cat_id for cat in categories):
+                    st.error(f"Category ID '{cat_id}' already exists")
+                else:
+                    categories.append({
+                        "id": cat_id,
+                        "name": cat_name,
+                        "description": cat_desc
+                    })
+                    if save_categories(categories):
+                        st.success(f"Category '{cat_name}' added")
+                        time.sleep(1)
+                        st.rerun()
+    
+    # Edit/delete categories
+    if categories:
+        st.subheader("Edit or Delete Categories")
+        
+        # Select category to edit/delete
+        selected_cat_name = st.selectbox(
+            "Select Category", 
+            options=[cat.get('name', f"Unnamed ({cat.get('id', 'unknown')})") for cat in categories],
+            key="edit_delete_category_select"
+        )
+        
+        selected_cat_index = next((i for i, cat in enumerate(categories) 
+                                if cat.get('name') == selected_cat_name), None)
+        
+        if selected_cat_index is not None:
+            selected_cat = categories[selected_cat_index]
+            
+            # Edit form
+            with st.form("edit_category_form"):
+                edit_name = st.text_input("Category Name", value=selected_cat.get('name', ''))
+                edit_id = st.text_input("Category ID", value=selected_cat.get('id', ''))
+                edit_desc = st.text_area("Category Description", value=selected_cat.get('description', ''))
+                
+                col1, col2 = st.columns(2)
+                update_btn = col1.form_submit_button("Update Category")
+                delete_btn = col2.form_submit_button("Delete Category")
+                
+                if update_btn:
+                    if not edit_name or not edit_id or not edit_desc:
+                        st.warning("All fields are required")
+                    else:
+                        # Check for duplicate IDs (excluding the current category)
+                        if edit_id != selected_cat.get('id') and any(cat.get('id') == edit_id for cat in categories):
+                            st.error(f"Category ID '{edit_id}' already exists")
+                        else:
+                            categories[selected_cat_index] = {
+                                "id": edit_id,
+                                "name": edit_name,
+                                "description": edit_desc
+                            }
+                            if save_categories(categories):
+                                st.success(f"Category '{edit_name}' updated")
+                                time.sleep(1)
+                                st.rerun()
+                
+                if delete_btn:
+                    categories.pop(selected_cat_index)
+                    if save_categories(categories):
+                        st.success(f"Category '{selected_cat_name}' deleted")
+                        time.sleep(1)
+                        st.rerun()
+
+def save_current_bucket():
+    global current_bucket, buckets, bucket_start_time
+    
+    if current_bucket["titles"] or current_bucket["ocr_text"]:
+        # Set the end time for the bucket
+        current_bucket["end"] = datetime.now().isoformat()
+        
+        # Generate summary and category with LLM
+        summary_text, category_id = generate_summary_from_raw_with_llm(
+            current_bucket["titles"], 
+            current_bucket["ocr_text"]
+        )
+        
+        # Add summary and category to bucket
+        if summary_text:
+            current_bucket["summary"] = summary_text
+        if category_id:
+            current_bucket["category_id"] = category_id
+        
+        # Add to list of buckets
+        buckets.append(current_bucket)
+        
+        # Save buckets to file
+        save_buckets_to_file()
+    
+    # Reset for next bucket
+    bucket_start_time = datetime.now()
+    current_bucket = {
+        "start": bucket_start_time.isoformat(),
+        "titles": [],
+        "ocr_text": []
+    }
 
 # --- Time Bucket Summaries Page ---
 def display_time_bucket_summaries():
     st.title("📝 5-Minute Summaries & Feedback")
     dates = load_available_dates()
-    if not dates: st.error("No data found in focus_logs directory."); st.stop()
+    if not dates:
+        st.error("No data found in focus_logs directory.")
+        st.stop()
     selected_date = st.selectbox("Select a date", dates, key="summaries_date_select")
     
     official_buckets = load_time_buckets_for_date(selected_date)
-    personal_notes_data = load_block_feedback() 
+    personal_notes_data = load_block_feedback()
+    categories = load_categories()  # Load categories
+    
+    if not official_buckets:
+        st.info(f"No 5-minute summary blocks found for {selected_date}.")
+        return
 
-    if not official_buckets: st.info(f"No 5-minute summary blocks found for {selected_date}."); return
+    # Create category filter if categories exist
+    category_filter = "All Categories"
+    if categories:
+        category_options = ["All Categories", "Uncategorized"] + [cat.get('name', 'Unknown') for cat in categories]
+        category_filter = st.selectbox("Filter by category", category_options, key="category_filter")
+    
+    # Count buckets by category
+    if categories:
+        cat_counts = {"Uncategorized": 0}
+        for cat in categories:
+            cat_counts[cat.get('name', 'Unknown')] = 0
+        
+        for bucket in official_buckets:
+            cat_id = bucket.get("category_id", "")
+            if cat_id:
+                cat_name = next((cat.get('name', 'Unknown') for cat in categories 
+                                if cat.get('id') == cat_id), "Uncategorized")
+                cat_counts[cat_name] = cat_counts.get(cat_name, 0) + 1
+            else:
+                cat_counts["Uncategorized"] = cat_counts.get("Uncategorized", 0) + 1
+        
+        # Display category counts
+        st.subheader("Summary Blocks by Category")
+        cols = st.columns(len(cat_counts))
+        for i, (cat_name, count) in enumerate(cat_counts.items()):
+            cols[i].metric(cat_name, count)
+        st.markdown("---")
 
     for idx, bucket_data in enumerate(official_buckets):
         bucket_start_iso = bucket_data["start"]
@@ -429,10 +1081,67 @@ def display_time_bucket_summaries():
         end_dt = pd.to_datetime(bucket_data.get("end", bucket_start_iso))
         time_range_display = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} (UTC {start_dt.strftime('%Y-%m-%d')})"
         
-        current_official_summary_text = bucket_data.get("summary", "") # This is from time_buckets_*.json
+        current_official_summary_text = bucket_data.get("summary", "")
         current_personal_note_text = personal_notes_data.get(bucket_start_iso, "")
+        current_category_id = bucket_data.get("category_id", "")
+        
+        # Find current category name from ID
+        current_category_name = "Uncategorized"
+        if current_category_id:
+            cat_match = next((cat.get('name', 'Unknown') for cat in categories 
+                            if cat.get('id') == current_category_id), "Uncategorized")
+            current_category_name = cat_match
+        
+        # Apply category filter
+        if category_filter != "All Categories":
+            if category_filter == "Uncategorized" and current_category_name != "Uncategorized":
+                continue
+            elif category_filter != "Uncategorized" and current_category_name != category_filter:
+                continue
 
-        with st.expander(time_range_display):
+        # Add category to expander title
+        expander_title = f"{time_range_display}"
+        if categories:
+            expander_title += f" - [{current_category_name}]"
+        
+        with st.expander(expander_title):
+            # Display category selection if categories exist
+            if categories:
+                st.markdown("**Current Category:**")
+                category_options = ["Uncategorized"] + [cat.get('name', 'Unknown') for cat in categories]
+                category_ids = [""] + [cat.get('id', '') for cat in categories]
+                
+                # Find index of current category in the options
+                selected_cat_index = 0  # Default to "Uncategorized"
+                if current_category_id:
+                    try:
+                        selected_cat_index = category_ids.index(current_category_id)
+                    except ValueError:
+                        pass  # Keep default if not found
+                
+                selected_category = st.selectbox(
+                    "Select category for this activity block",
+                    options=category_options,
+                    index=selected_cat_index,
+                    key=f"category_select_{idx}_{bucket_start_iso}"
+                )
+                
+                # Get the ID for the selected category name
+                selected_cat_id = ""
+                if selected_category != "Uncategorized":
+                    selected_cat_index = category_options.index(selected_category)
+                    if selected_cat_index > 0:  # Skip "Uncategorized"
+                        selected_cat_id = category_ids[selected_cat_index - 1]  # Adjust index for the offset
+                
+                # Update category if changed
+                if selected_cat_id != current_category_id:
+                    if st.button("Update Category", key=f"update_cat_btn_{idx}_{bucket_start_iso}"):
+                        if update_bucket_category_in_file(session_tag, bucket_start_iso, selected_cat_id):
+                            st.success(f"Category updated to '{selected_category}'")
+                            time.sleep(1)
+                            st.rerun()
+            
+            # Current summary display
             st.markdown("**Current Official Summary (from log file):**")
             st.caption(current_official_summary_text or "_No official summary available for this block._")
             
@@ -441,7 +1150,7 @@ def display_time_bucket_summaries():
                 "Use this text area to: (1) Save a personal note, (2) Provide feedback for the LLM to refine the summary, or (3) Write your own summary to replace the current one.", 
                 value=current_personal_note_text, 
                 key=f"user_text_area_{idx}_{bucket_start_iso}",
-                height=100 # Adjust height as needed
+                height=100
             )
 
             # --- Personal Note Actions ---
@@ -477,9 +1186,17 @@ def display_time_bucket_summaries():
             with official_summary_action_cols[1]:
                 if st.button("Refine LLM Summary", key=f"refine_llm_summary_btn_{idx}_{bucket_start_iso}", help="Uses the 'Current Official Summary' AND the text from 'Your Input Text' (as feedback) to ask the LLM to generate an improved summary. This new summary will replace the current one in the log file."):
                     if user_input_text.strip(): 
-                        refined_summary_text = refine_summary_with_llm(current_official_summary_text, user_input_text.strip())
+                        refined_summary_text, refined_category_id = refine_summary_with_llm(
+                            current_official_summary_text, 
+                            user_input_text.strip(),
+                            current_category_id
+                        )
                         if refined_summary_text is not None:
+                            # Update summary
                             if update_bucket_summary_in_file(session_tag, bucket_start_iso, refined_summary_text):
+                                # Update category if it changed
+                                if refined_category_id != current_category_id:
+                                    update_bucket_category_in_file(session_tag, bucket_start_iso, refined_category_id)
                                 st.success("LLM summary refined and updated!"); time.sleep(1); st.rerun()
                             else: st.error("Failed to save LLM-refined official summary.")
                     else: st.warning("Please enter some feedback in the 'Your Input Text' area to help refine the summary.")
@@ -488,12 +1205,17 @@ def display_time_bucket_summaries():
                 if st.button("Re-Generate Original LLM Summary", key=f"regenerate_original_llm_summary_btn_{idx}_{bucket_start_iso}", help="Asks the LLM to create a brand new summary based on the raw window titles and OCR text recorded for this block. This will replace the 'Current Official Summary' in the log file."):
                     raw_titles_list = bucket_data.get("titles", [])
                     raw_ocr_list = bucket_data.get("ocr_text", [])
-                    regenerated_summary_text = generate_summary_from_raw_with_llm(raw_titles_list, raw_ocr_list)
+                    regenerated_summary_text, regenerated_category_id = generate_summary_from_raw_with_llm(
+                        raw_titles_list, raw_ocr_list
+                    )
                     if regenerated_summary_text is not None: 
+                        # Update summary
                         if update_bucket_summary_in_file(session_tag, bucket_start_iso, regenerated_summary_text):
+                            # Update category
+                            if regenerated_category_id:
+                                update_bucket_category_in_file(session_tag, bucket_start_iso, regenerated_category_id)
                             st.success("Original LLM summary re-generated and updated!"); time.sleep(1); st.rerun()
                         else: st.error("Failed to save LLM re-generated official summary.")
-
 
 # --- Label Editor Page ---
 def display_label_editor():
@@ -665,7 +1387,6 @@ def display_label_editor():
             else:
                 st.info("No data to summarize by label for this date after applying labels.")
 
-
 # --- Dashboard Page ---
 def display_dashboard():
     st.title("📊 Focus Monitor Dashboard")
@@ -679,9 +1400,62 @@ def display_dashboard():
     # --- Summary Metrics ---
     d_col1, d_col2, d_col3 = st.columns(3)
     d_col1.metric("🕒 Total Tracked Time", f"{daily_summary_data.get('totalTime', 0) // 60} min")
-    # Add Focus Score and Meeting Time if they are part of your daily_summary_data structure from standalone_focus_monitor.py
-    # For now, they are not in the simplified generate_summary_from_logs
     
+    # --- NEW: Category Analysis ---
+    categories = load_categories()
+    all_buckets = load_time_buckets_for_date(selected_date)
+    
+    if categories and all_buckets:
+        st.subheader("🏆 Activity by Category")
+        
+        # Create category chart
+        fig_category = create_category_chart(all_buckets, categories)
+        if fig_category:
+            st.plotly_chart(fig_category, use_container_width=True)
+            
+            # Create a detailed breakdown table
+            cat_id_to_name = {cat.get('id', ''): cat.get('name', 'Unknown') for cat in categories}
+            category_data = []
+            
+            for bucket in all_buckets:
+                cat_id = bucket.get('category_id', '')
+                cat_name = cat_id_to_name.get(cat_id, 'Uncategorized') if cat_id else 'Uncategorized'
+                
+                start_time = pd.to_datetime(bucket.get('start', ''))
+                end_time = pd.to_datetime(bucket.get('end', bucket.get('start', '')))
+                
+                if start_time and end_time:
+                    duration_seconds = (end_time - start_time).total_seconds()
+                    category_data.append({
+                        'Category': cat_name,
+                        'Start Time': start_time.strftime('%H:%M'),
+                        'End Time': end_time.strftime('%H:%M'),
+                        'Duration (min)': round(duration_seconds / 60, 1),
+                        'Summary': bucket.get('summary', '')[:50] + ('...' if bucket.get('summary', '') and len(bucket.get('summary', '')) > 50 else '')
+                    })
+            
+            if category_data:
+                df_categories = pd.DataFrame(category_data)
+                # Group by category and calculate total time
+                category_totals = df_categories.groupby('Category')['Duration (min)'].sum().reset_index()
+                category_totals['Percentage'] = (category_totals['Duration (min)'] / category_totals['Duration (min)'].sum() * 100).round(1)
+                category_totals = category_totals.sort_values('Duration (min)', ascending=False)
+                
+                st.subheader("Category Time Distribution")
+                st.dataframe(category_totals, use_container_width=True)
+                
+                with st.expander("View Detailed Category Timeline"):
+                    st.dataframe(
+                        df_categories.sort_values('Start Time'),
+                        use_container_width=True
+                    )
+        else:
+            st.info("No category data available for visualization.")
+    elif categories:
+        st.info("No time bucket data available for category analysis.")
+    else:
+        st.info("No categories defined. Go to the 'Activity Categories Manager' tab to create categories.")
+
     st.subheader("🧠 Time Distribution by Application/Activity (Post-Labeling)")
     app_breakdown_data = daily_summary_data.get("appBreakdown", [])
     if app_breakdown_data:
@@ -770,6 +1544,7 @@ def display_dashboard():
     This dashboard displays data collected by the Focus Monitor agent. The agent tracks your active windows and applications to help you understand your computer usage patterns.
     - **Labels**: Use the '🏷 Activity Label Editor' tab to categorize your time.
     - **Summaries**: Use the '📝 Summaries' tab to review, note, and refine 5-minute block summaries.
+    - **Categories**: Use the '🏆 Activity Categories Manager' tab to define high-level activity categories.
     
     To generate data:
     1. Ensure the Focus Monitor agent (`standalone_focus_monitor.py`) is running in the background.
@@ -782,20 +1557,13 @@ def display_dashboard():
 def main():
     st.set_page_config(page_title="Focus Monitor Dashboard", layout="wide", initial_sidebar_state="expanded")
     
-    # Sidebar for tracker control (optional, can be removed if tracker is managed externally)
-    # st.sidebar.title("Tracker Control")
-    # if st.sidebar.button("Start Tracker", key="start_tracker_btn"):
-    #     start_tracker()
-    # if st.sidebar.button("Stop Tracker", key="stop_tracker_btn"):
-    #     stop_tracker()
-    # st.sidebar.caption(f"Tracker Running: {is_tracker_running()}")
-    # st.sidebar.markdown("---")
-
-
-    tab_dashboard, tab_label_editor, tab_summaries = st.tabs([
+    # Add retroactive processor tab to the navigation
+    tab_dashboard, tab_label_editor, tab_summaries, tab_categories, tab_processor = st.tabs([
         "📊 Dashboard", 
         "🏷 Activity Label Editor", 
-        "📝 5-Min Summaries & Feedback"
+        "📝 5-Min Summaries & Feedback",
+        "🏆 Activity Categories Manager",
+        "⏮️ Historical Processor"
     ])
 
     with tab_dashboard:
@@ -804,6 +1572,10 @@ def main():
         display_label_editor()
     with tab_summaries:
         display_time_bucket_summaries()
+    with tab_categories:
+        display_category_manager()
+    with tab_processor:
+        display_retroactive_processor()
 
 if __name__ == "__main__":
     main()
