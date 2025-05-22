@@ -1,14 +1,13 @@
 """
-Data Utilities for Focus Monitor Dashboard.
+Data Utilities for Focus Monitor Dashboard - Updated with Browser Profile Daily Aggregation
 
 This module provides functions for loading, processing, and saving data used in the
-Focus Monitor Dashboard. It handles operations such as:
-- Loading and saving activity logs and summaries
-- Managing activity labels and categories
-- Processing time buckets and feedback data
-- Generating summaries from raw logs
+Focus Monitor Dashboard, including support for daily browser profile aggregations.
 
-All data is stored in the focus_logs directory within the parent directory.
+Key Updates:
+- Added functions to load and manage daily browser profile aggregations
+- Browser profile activities are excluded from 5-minute buckets
+- Browser activities are aggregated daily by category
 """
 
 import json
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-import streamlit as st # Keep for type hinting and potential direct use if careful
+import streamlit as st
 
 # Define constants for file paths
 LOGS_DIR = Path(__file__).resolve().parent.parent / "focus_logs"
@@ -28,18 +27,12 @@ CATEGORIES_FILE = LOGS_DIR / "activity_categories.json"
 
 # Helper to check Streamlit context safely
 def _is_streamlit_running() -> bool:
-    """Checks if the code is running in a Streamlit context by checking session_state."""
-    # This assumes 'streamlit_running' is set to True at the start of the Streamlit app script.
+    """Checks if the code is running in a Streamlit context."""
     return st.session_state.get('streamlit_running', False)
 
 
 def load_available_dates() -> List[str]:
-    """
-    Return a sorted list of dates that have log or summary files.
-    
-    Returns:
-        List[str]: Sorted list of dates in descending order (newest first).
-    """
+    """Return a sorted list of dates that have log or summary files."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     
     log_dates = {
@@ -50,19 +43,17 @@ def load_available_dates() -> List[str]:
         f.name.split("_")[-1].replace(".json", "") 
         for f in LOGS_DIR.glob("daily_summary_*.json")
     }
-    return sorted(list(log_dates.union(summary_dates)), reverse=True)
+    browser_dates = {
+        f.name.split("_")[-1].replace(".json", "")
+        for f in LOGS_DIR.glob("daily_browser_activities_*.json")
+    }
+    
+    all_dates = log_dates.union(summary_dates).union(browser_dates)
+    return sorted(list(all_dates), reverse=True)
 
 
 def load_log_entries(date_str: str) -> pd.DataFrame:
-    """
-    Load log entries for a specific date into a DataFrame.
-    
-    Args:
-        date_str: Date string in format 'YYYY-MM-DD'
-        
-    Returns:
-        pd.DataFrame: DataFrame containing log entries, or empty DataFrame if no data.
-    """
+    """Load log entries for a specific date into a DataFrame."""
     file_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
     if not file_path.exists():
         return pd.DataFrame()
@@ -77,18 +68,36 @@ def load_log_entries(date_str: str) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def load_daily_summary(date_str: str) -> Optional[Dict[str, Any]]:
+def load_daily_browser_activities(date_str: str) -> List[Dict[str, Any]]:
     """
-    Load or generate a daily summary for a specific date.
-    
-    Tries to load pre-generated summary first, falls back to generating
-    from raw logs if summary file doesn't exist or is corrupted.
+    Load daily browser profile activities for a specific date.
     
     Args:
         date_str: Date string in format 'YYYY-MM-DD'
         
     Returns:
-        Dict[str, Any]: Summary data, or None if no data available and generation fails.
+        List[Dict]: List of browser activity aggregations for the date
+    """
+    file_path = LOGS_DIR / f"daily_browser_activities_{date_str}.json"
+    if not file_path.exists():
+        return []
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode browser activities file {file_path.name}")
+        return []
+    except Exception as e:
+        print(f"Error loading browser activities from {file_path.name}: {e}")
+        return []
+
+
+def load_daily_summary(date_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Load or generate a daily summary for a specific date.
+    Now includes browser profile daily aggregations in the summary.
     """
     file_path = LOGS_DIR / f"daily_summary_{date_str}.json"
     if file_path.exists():
@@ -96,22 +105,26 @@ def load_daily_summary(date_str: str) -> Optional[Dict[str, Any]]:
             with open(file_path, "r", encoding="utf-8") as f:
                 summary_data = json.load(f)
                 if "date" in summary_data and "appBreakdown" in summary_data:
+                    # Add browser activities to the summary
+                    browser_activities = load_daily_browser_activities(date_str)
+                    if browser_activities:
+                        summary_data["browserProfileActivities"] = browser_activities
                     return summary_data
                 else:
                     if _is_streamlit_running():
                         st.warning(f"Summary file {file_path.name} seems incomplete. Will attempt to regenerate.")
                     else:
-                        print(f"Warning: Summary file {file_path.name} seems incomplete. Will attempt to regenerate.")
+                        print(f"Warning: Summary file {file_path.name} seems incomplete.")
         except json.JSONDecodeError:
             if _is_streamlit_running():
                 st.error(f"Error decoding summary file {file_path.name}. Will attempt to regenerate.")
             else:
-                print(f"Error: Error decoding summary file {file_path.name}. Will attempt to regenerate.")
+                print(f"Error: Error decoding summary file {file_path.name}.")
         except Exception as e:
             if _is_streamlit_running():
                 st.error(f"Unexpected error loading summary {file_path.name}: {e}. Will attempt to regenerate.")
             else:
-                print(f"Error: Unexpected error loading summary {file_path.name}: {e}. Will attempt to regenerate.")
+                print(f"Error: Unexpected error loading summary {file_path.name}: {e}.")
 
     if _is_streamlit_running():
         st.info(f"Generating daily summary for {date_str} from raw logs...")
@@ -123,14 +136,7 @@ def load_daily_summary(date_str: str) -> Optional[Dict[str, Any]]:
 def generate_summary_from_logs(date_str: str) -> Optional[Dict[str, Any]]:
     """
     Generate a daily summary by processing raw log entries for a specific date.
-    This summary includes app breakdowns with labeled app names and basic metrics.
-    Saves the summary to 'daily_summary_{date_str}.json'.
-
-    Args:
-        date_str: Date string in format 'YYYY-MM-DD'
-
-    Returns:
-        Dict[str, Any]: Generated summary, or None if no log data or critical error.
+    Now excludes browser profile activities from app breakdown and includes them separately.
     """
     logs_df = load_log_entries(date_str)
     
@@ -138,86 +144,103 @@ def generate_summary_from_logs(date_str: str) -> Optional[Dict[str, Any]]:
         if _is_streamlit_running():
             st.warning(f"No log entries found for {date_str}. Cannot generate full summary.")
         else:
-            print(f"Warning: No log entries found for {date_str}. Cannot generate full summary.")
+            print(f"Warning: No log entries found for {date_str}.")
             
         empty_summary: Dict[str, Any] = {
             "date": date_str, "totalTime": 0, "appBreakdown": [],
             "focusScore": 0, "distractionEvents": 0, "meetingTime": 0,
-            "productiveApps": [], "distractionApps": []
+            "productiveApps": [], "distractionApps": [],
+            "browserProfileActivities": []
         }
+        
+        # Check for browser activities even if no regular logs
+        browser_activities = load_daily_browser_activities(date_str)
+        if browser_activities:
+            empty_summary["browserProfileActivities"] = browser_activities
+            total_browser_time = sum(activity.get("total_duration", 0) for activity in browser_activities)
+            empty_summary["totalTime"] = total_browser_time
+            
         summary_file_path = LOGS_DIR / f"daily_summary_{date_str}.json"
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
             with open(summary_file_path, "w", encoding="utf-8") as f:
                 json.dump(empty_summary, f, indent=2)
-            if _is_streamlit_running():
-                st.info(f"Empty daily summary saved for {date_str} as no logs were found.")
-            else:
-                print(f"Info: Empty daily summary saved for {date_str} as no logs were found.")
         except Exception as e_save:
             if _is_streamlit_running():
-                st.error(f"Error saving empty daily summary for {date_str}: {e_save}")
+                st.error(f"Error saving summary for {date_str}: {e_save}")
             else:
-                print(f"Error: Error saving empty daily summary for {date_str}: {e_save}")
+                print(f"Error: Error saving summary for {date_str}: {e_save}")
         return empty_summary
 
+    # Apply labels to logs
     logs_df_labeled = apply_labels_to_logs(logs_df.copy()) 
 
     if "duration" not in logs_df_labeled.columns or logs_df_labeled["duration"].isnull().all():
         if _is_streamlit_running():
             st.error(f"Log data for {date_str} is missing valid 'duration' information after labeling.")
         else:
-            print(f"Error: Log data for {date_str} is missing valid 'duration' information after labeling.")
+            print(f"Error: Log data for {date_str} is missing valid 'duration' information.")
         return None 
 
-    total_duration = logs_df_labeled["duration"].sum()
+    # Separate browser profile activities from regular activities
+    browser_profile_logs = logs_df_labeled[logs_df_labeled.get("detected_profile_category", "").notna() & 
+                                          (logs_df_labeled.get("detected_profile_category", "") != "")]
+    regular_logs = logs_df_labeled[~logs_df_labeled.index.isin(browser_profile_logs.index)]
+
+    # Calculate total duration including browser activities
+    total_duration_all = logs_df_labeled["duration"].sum()
+    regular_duration = regular_logs["duration"].sum() if not regular_logs.empty else 0
+    browser_duration = browser_profile_logs["duration"].sum() if not browser_profile_logs.empty else 0
 
     summary: Dict[str, Any] = {
         "date": date_str, 
-        "totalTime": round(total_duration), 
+        "totalTime": round(total_duration_all),  # Include all activities in total
         "appBreakdown": [],
         "focusScore": 0,
         "distractionEvents": len(logs_df_labeled), 
         "meetingTime": 0,
         "productiveApps": [], 
-        "distractionApps": [], 
+        "distractionApps": [],
+        "browserProfileActivities": []
     }
     
-    if total_duration > 0:
-        if "app_name" not in logs_df_labeled.columns: 
-            logs_df_labeled["app_name"] = "Unknown Application"
-        if "exe" not in logs_df_labeled.columns:
-            logs_df_labeled["exe"] = "unknown.exe"
+    # Process regular (non-browser-profile) activities for app breakdown
+    if not regular_logs.empty and regular_duration > 0:
+        if "app_name" not in regular_logs.columns: 
+            regular_logs["app_name"] = "Unknown Application"
+        if "exe" not in regular_logs.columns:
+            regular_logs["exe"] = "unknown.exe"
 
         agg_dict = {
             "exe_path": ("exe", "first"),
             "time_spent": ("duration", "sum"),
         }
 
-        if "title" in logs_df_labeled.columns:
+        if "title" in regular_logs.columns:
             agg_dict["window_titles"] = ("title", lambda x: sorted(list(set(str(t).strip() for t in x if pd.notna(t) and str(t).strip()))[:50]))
         else:
             agg_dict["window_titles"] = ("app_name", lambda x: []) 
 
-        if "ocr_text" in logs_df_labeled.columns:
+        if "ocr_text" in regular_logs.columns:
             agg_dict["ocr_texts"] = ("ocr_text", lambda x: sorted(list(set(str(t).strip() for t in x if pd.notna(t) and str(t).strip()))[:20]))
         else:
             agg_dict["ocr_texts"] = ("app_name", lambda x: [])
 
-        if "screenshot_path" in logs_df_labeled.columns:
+        if "screenshot_path" in regular_logs.columns:
             agg_dict["screenshot_paths"] = ("screenshot_path", lambda x: sorted(list(set(str(t).strip() for t in x if pd.notna(t) and str(t).strip()))[:20]))
         else:
             agg_dict["screenshot_paths"] = ("app_name", lambda x: [])
         
         app_groups = (
-            logs_df_labeled.groupby("app_name")
+            regular_logs.groupby("app_name")
             .agg(**agg_dict) 
             .reset_index()
         )
 
         app_breakdown_list = []
         for _, row in app_groups.iterrows():
-            percentage = (row["time_spent"] / total_duration * 100) if total_duration > 0 else 0
+            # Calculate percentage against total time (including browser activities)
+            percentage = (row["time_spent"] / total_duration_all * 100) if total_duration_all > 0 else 0
             
             titles_list = row.get("window_titles", []) 
             if not isinstance(titles_list, list): 
@@ -232,25 +255,61 @@ def generate_summary_from_logs(date_str: str) -> Optional[Dict[str, Any]]:
                 "ocrTexts": row.get("ocr_texts", []), 
                 "screenshotPaths": row.get("screenshot_paths", []), 
             })
-        summary["appBreakdown"].sort(key=lambda x: x["timeSpent"], reverse=True)
+        
+        summary["appBreakdown"] = sorted(app_breakdown_list, key=lambda x: x["timeSpent"], reverse=True)
+
+    # Load and include browser profile activities
+    browser_activities = load_daily_browser_activities(date_str)
+    if browser_activities:
+        # Convert browser activities to app breakdown format for compatibility
+        for browser_activity in browser_activities:
+            # Calculate percentage against total time
+            percentage = (browser_activity.get("total_duration", 0) / total_duration_all * 100) if total_duration_all > 0 else 0
+            
+            # Find a representative app name from the activity
+            app_names = browser_activity.get("app_names", set())
+            if isinstance(app_names, list):
+                app_names = set(app_names)
+            representative_name = next(iter(app_names)) if app_names else f"Browser Profile ({browser_activity.get('category_id', 'Unknown')})"
+            
+            browser_app_entry = {
+                "appName": representative_name,
+                "exePath": "browser_profile_aggregated",
+                "timeSpent": int(browser_activity.get("total_duration", 0)),
+                "percentage": round(percentage, 2),
+                "windowTitles": list(browser_activity.get("titles", [])),
+                "ocrTexts": list(browser_activity.get("ocr_text", [])),
+                "screenshotPaths": [],
+                "isBrowserProfile": True,  # Flag to identify browser profile activities
+                "categoryId": browser_activity.get("category_id", ""),
+                "activityCount": browser_activity.get("activity_count", 0)
+            }
+            
+            summary["appBreakdown"].append(browser_app_entry)
+        
+        # Re-sort app breakdown to include browser activities
+        summary["appBreakdown"] = sorted(summary["appBreakdown"], key=lambda x: x["timeSpent"], reverse=True)
+        summary["browserProfileActivities"] = browser_activities
     
+    # Save summary to file
     summary_file_path = LOGS_DIR / f"daily_summary_{date_str}.json"
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         with open(summary_file_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         if _is_streamlit_running():
-            st.success(f"Daily summary for {date_str} generated/updated and saved to {summary_file_path.name}")
+            st.success(f"Daily summary for {date_str} generated/updated and saved")
         else:
-            print(f"Daily summary for {date_str} generated/updated and saved to {summary_file_path.name}")
+            print(f"Daily summary for {date_str} generated/updated and saved")
     except Exception as e:
         if _is_streamlit_running():
-            st.error(f"Error saving daily summary file {summary_file_path.name}: {e}")
+            st.error(f"Error saving daily summary file: {e}")
         else:
-            print(f"Error: Error saving daily summary file {summary_file_path.name}: {e}")
+            print(f"Error: Error saving daily summary file: {e}")
         return None
 
     return summary
+
 
 # ----- Label Management Functions -----
 
@@ -282,7 +341,6 @@ def apply_labels_to_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
     """
     Apply activity labels to log entries.
     Updates 'app_name' in the DataFrame based on label matching rules.
-    Adds 'original_app_name' to preserve the pre-labeling app name.
     """
     if logs_df.empty:
         return logs_df
@@ -303,20 +361,25 @@ def apply_labels_to_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
         df.drop(columns=["labeled_app_name"], inplace=True, errors="ignore") 
         return df
 
+    # Apply exact title labels
     for key, label_val in labels.get("exact_titles", {}).items():
         try:
             _, exe_from_key, title_from_key = key.split("::", 2)
             mask = (df["exe"].str.lower() == exe_from_key.lower()) & \
                    (df["title"] == title_from_key) 
             df.loc[mask, "labeled_app_name"] = label_val
-        except ValueError: print(f"Warning: Skipping malformed exact_title key: {key}")
-        except Exception as e: print(f"Error applying exact title label for '{key}': {e}")
+        except ValueError: 
+            print(f"Warning: Skipping malformed exact_title key: {key}")
+        except Exception as e: 
+            print(f"Error applying exact title label for '{key}': {e}")
 
+    # Apply exact exe labels
     for exe_basename_key, label_val in labels.get("exact_exe", {}).items():
         mask = (df["exe"].apply(lambda x: os.path.basename(x).lower()) == exe_basename_key.lower()) & \
                (df["labeled_app_name"] == df["original_app_name"]) 
         df.loc[mask, "labeled_app_name"] = label_val
     
+    # Apply pattern labels
     for key, label_val in labels.get("patterns", {}).items():
         try:
             _, exe_basename_key, pattern_from_key = key.split("::", 2)
@@ -326,8 +389,10 @@ def apply_labels_to_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
                 (df["labeled_app_name"] == df["original_app_name"]) 
             )
             df.loc[mask, "labeled_app_name"] = label_val
-        except ValueError: print(f"Warning: Skipping malformed pattern key: {key}")
-        except Exception as e: print(f"Error applying pattern label for '{key}': {e}")
+        except ValueError: 
+            print(f"Warning: Skipping malformed pattern key: {key}")
+        except Exception as e: 
+            print(f"Error applying pattern label for '{key}': {e}")
             
     df["app_name"] = df["labeled_app_name"]
     df.drop(columns=["labeled_app_name"], inplace=True, errors="ignore") 
@@ -336,7 +401,7 @@ def apply_labels_to_logs(logs_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def group_activities_for_labeling(logs_df: pd.DataFrame) -> pd.DataFrame:
-    """Group activities by window title for easier labeling, using original app names."""
+    """Group activities by window title for easier labeling."""
     if logs_df.empty: return pd.DataFrame()
 
     df_copy = logs_df.copy()
@@ -396,28 +461,24 @@ def save_block_feedback(feedback_data: Dict[str, str]) -> bool:
 # ----- Time Bucket Helper Functions -----
 
 def load_time_buckets_for_date(date_str: str) -> List[Dict[str, Any]]:
+    """Load time buckets for a date. Note: Browser profile activities are now excluded from buckets."""
     buckets_with_tags: List[Dict[str, Any]] = []
     for path in LOGS_DIR.glob("time_buckets_*.json"):
         try:
-            # A simple check: if the date string is in the filename, it's a candidate.
-            # More robustly, one might always load and then filter by the 'start' time of buckets.
-            # For now, this heuristic assumes filenames might contain the date or be session-specific.
             load_this_file = date_str in path.name 
-            if not load_this_file: # If date not in name, check if it's a generic session file
-                # This could be refined, e.g. by checking file modification time if relevant
-                # For now, we assume if date_str is not in name, we might still need to check its contents
-                # if the file naming isn't strictly 'time_buckets_YYYY-MM-DD.json'
-                pass # Let's assume we always check contents if not explicitly dated by name
+            if not load_this_file:
+                pass
 
             session_tag = path.name.replace("time_buckets_", "").replace(".json", "")
             with open(path, "r", encoding="utf-8") as f: data = json.load(f)
             for b_data in data:
-                if b_data.get("start", "")[:10] == date_str: # Filter by bucket's start date
+                if b_data.get("start", "")[:10] == date_str:
                     b_copy = b_data.copy(); b_copy["session_tag"] = session_tag 
                     buckets_with_tags.append(b_copy)
         except Exception as e:
             if _is_streamlit_running(): st.error(f"Error reading bucket file {path.name}: {e}")
             else: print(f"Error reading bucket file {path.name}: {e}")
+    
     buckets_with_tags.sort(key=lambda x: x.get("start", ""))
     return buckets_with_tags
 
@@ -432,7 +493,6 @@ def update_bucket_summary_in_file(session_tag: str, bucket_start_iso: str, new_s
             print(msg)
         return False
     try:
-        # Read current data
         with open(bucket_file_path, "r", encoding="utf-8") as f:
             all_buckets_data = json.load(f)
         
@@ -443,19 +503,18 @@ def update_bucket_summary_in_file(session_tag: str, bucket_start_iso: str, new_s
                 found_bucket = True; break
         
         if not found_bucket:
-            msg = f"Bucket {bucket_start_iso} not found in {bucket_file_path.name} for summary update."
+            msg = f"Bucket {bucket_start_iso} not found in {bucket_file_path.name}"
             if _is_streamlit_running(): 
                 st.error(msg)
             else: 
                 print(msg)
             return False
             
-        # Write updated data back
         with open(bucket_file_path, "w", encoding="utf-8") as f:
             json.dump(all_buckets_data, f, indent=2)
         return True
     except Exception as e:
-        msg = f"Error updating official summary in {bucket_file_path.name}: {e}"
+        msg = f"Error updating summary in {bucket_file_path.name}: {e}"
         if _is_streamlit_running(): 
             st.error(msg)
         else: 
@@ -470,7 +529,7 @@ def load_categories() -> List[Dict[str, str]]:
     try:
         with open(CATEGORIES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f); return data.get("categories", []) 
-    except Exception as e: print(f"Error loading categories from {CATEGORIES_FILE}: {e}"); return []
+    except Exception as e: print(f"Error loading categories: {e}"); return []
 
 def save_categories(categories: List[Dict[str, str]]) -> bool:
     try:
@@ -493,7 +552,7 @@ def update_bucket_category_in_file(session_tag: str, bucket_start_iso: str, new_
             print(msg)
         return False
     try:
-        with open(bucket_file_path, "r", encoding="utf-8") as f: # Read first
+        with open(bucket_file_path, "r", encoding="utf-8") as f:
             all_buckets_data = json.load(f)
         
         found_bucket = False
@@ -503,14 +562,14 @@ def update_bucket_category_in_file(session_tag: str, bucket_start_iso: str, new_
                 found_bucket = True; break
         
         if not found_bucket:
-            msg = f"Bucket {bucket_start_iso} not found in {bucket_file_path.name} for category update."
+            msg = f"Bucket {bucket_start_iso} not found in {bucket_file_path.name}"
             if _is_streamlit_running(): 
                 st.error(msg)
             else: 
                 print(msg)
             return False
             
-        with open(bucket_file_path, "w", encoding="utf-8") as f: # Write updated
+        with open(bucket_file_path, "w", encoding="utf-8") as f:
             json.dump(all_buckets_data, f, indent=2)
         return True
     except Exception as e:
@@ -522,6 +581,10 @@ def update_bucket_category_in_file(session_tag: str, bucket_start_iso: str, new_
         return False
 
 def generate_time_buckets_from_logs(date_str: str) -> bool:
+    """
+    Generate time buckets from logs for a specific date.
+    Note: Browser profile activities will be excluded from buckets as they are handled daily.
+    """
     is_st_true = _is_streamlit_running() 
 
     log_path = LOGS_DIR / f"focus_log_{date_str}.jsonl"
@@ -541,7 +604,20 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
         else: 
             print(msg)
         return False
-    if "timestamp" not in logs_df.columns:
+    
+    # Filter out browser profile activities (they have detected_profile_category)
+    non_browser_logs = logs_df[~(logs_df.get("detected_profile_category", "").notna() & 
+                                (logs_df.get("detected_profile_category", "") != ""))]
+    
+    if non_browser_logs.empty:
+        msg=f"No non-browser-profile activities found for {date_str} to create time buckets."
+        if is_st_true: 
+            st.info(msg)
+        else: 
+            print(msg)
+        return False
+    
+    if "timestamp" not in non_browser_logs.columns:
         msg="Log data missing timestamp column."
         if is_st_true: 
             st.error(msg)
@@ -550,10 +626,10 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
         return False
 
     try:
-        logs_df["timestamp"] = pd.to_datetime(logs_df["timestamp"], errors='coerce')
-        logs_df.dropna(subset=["timestamp"], inplace=True) 
-        if logs_df.empty:
-             msg="No valid timestamps in log data after conversion."
+        non_browser_logs["timestamp"] = pd.to_datetime(non_browser_logs["timestamp"], errors='coerce')
+        non_browser_logs.dropna(subset=["timestamp"], inplace=True) 
+        if non_browser_logs.empty:
+             msg="No valid timestamps in non-browser log data after conversion."
              if is_st_true: 
                  st.error(msg)
              else: 
@@ -567,8 +643,9 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
             print(msg)
         return False
         
-    logs_df = logs_df.sort_values("timestamp")
-    min_time = logs_df["timestamp"].min(); max_time = logs_df["timestamp"].max()
+    non_browser_logs = non_browser_logs.sort_values("timestamp")
+    min_time = non_browser_logs["timestamp"].min()
+    max_time = non_browser_logs["timestamp"].max()
     bucket_duration_minutes = 5 
     bucket_size_timedelta = pd.Timedelta(minutes=bucket_duration_minutes)
     start_time_aligned = min_time.floor(f"{bucket_duration_minutes}min")
@@ -580,7 +657,7 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
         current_bucket_start += bucket_size_timedelta
 
     if not bucket_start_timestamps:
-        msg = f"Not enough time range in logs for {date_str} to create {bucket_duration_minutes}-min buckets."
+        msg = f"Not enough time range in non-browser logs for {date_str} to create {bucket_duration_minutes}-min buckets."
         if is_st_true: 
             st.warning(msg)
         else: 
@@ -589,13 +666,11 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
 
     generated_buckets_list: List[Dict[str, Any]] = []
     
-    # This import is fine here as generate_time_buckets_from_logs is typically called from dashboard context
-    # and llm_utils does not import data_utils directly.
     from .llm_utils import generate_summary_from_raw_with_llm  
 
     for bucket_dt_start in bucket_start_timestamps:
         bucket_dt_end = bucket_dt_start + bucket_size_timedelta
-        current_bucket_logs_df = logs_df[(logs_df["timestamp"] >= bucket_dt_start) & (logs_df["timestamp"] < bucket_dt_end)]
+        current_bucket_logs_df = non_browser_logs[(non_browser_logs["timestamp"] >= bucket_dt_start) & (non_browser_logs["timestamp"] < bucket_dt_end)]
         
         if not current_bucket_logs_df.empty:
             window_titles_list: List[str] = []
@@ -606,12 +681,13 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
             if "ocr_text" in current_bucket_logs_df.columns:
                 ocr_text_snippets = current_bucket_logs_df["ocr_text"].dropna().astype(str).str.strip().unique().tolist()
                 ocr_text_snippets = [o for o in ocr_text_snippets if o]
+            
             bucket_entry: Dict[str, Any] = {
                 "start": bucket_dt_start.isoformat(), "end": bucket_dt_end.isoformat(),
                 "titles": window_titles_list, "ocr_text": ocr_text_snippets,
                 "summary": "", "category_id": "" 
             }
-            # The fourth return value (prompt) is ignored here.
+            
             llm_summary, llm_category_id, _suggested_category, _prompt = generate_summary_from_raw_with_llm(
                 window_titles_list, ocr_text_snippets, allow_suggestions=True, return_prompt=False
             )
@@ -620,23 +696,19 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
             generated_buckets_list.append(bucket_entry)
 
     if not generated_buckets_list:
-        msg = f"No activity found within defined time buckets for {date_str}."
+        msg = f"No non-browser activity found within defined time buckets for {date_str}."
         if is_st_true: 
             st.warning(msg)
         else: 
             print(msg)
-        # Decide if an empty bucket file should be written or just return False
-        # For now, returning False as no useful buckets were made.
         return False 
 
-    # For retroactive generation, a file per date is clear.
-    # For live agent generation, session_tag based naming is in standalone_focus_monitor.
     bucket_file_path = LOGS_DIR / f"time_buckets_{date_str}.json" 
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         with open(bucket_file_path, "w", encoding="utf-8") as f:
             json.dump(generated_buckets_list, f, indent=2)
-        msg = f"Time buckets for {date_str} generated ({len(generated_buckets_list)} buckets) and saved to {bucket_file_path.name}"
+        msg = f"Time buckets for {date_str} generated ({len(generated_buckets_list)} buckets, browser profiles excluded)"
         if is_st_true: 
             st.success(msg)
         else: 
@@ -650,19 +722,19 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
             print(msg)
         return False
 
+# Browser Profile Management (existing functions remain the same)
 BROWSER_PROFILES_FILE = LOGS_DIR / "browser_profiles.json"
 
 def load_browser_profiles() -> List[Dict[str, Any]]:
     """Load browser profiles from the profiles file."""
     if not BROWSER_PROFILES_FILE.exists():
-        # Return default profile if file doesn't exist
         return [
             {
                 "name": "Edge - Personal",
                 "exe_pattern": "msedge.exe",
-                "color_rgb": [7, 43, 71],  # Store as list for JSON compatibility
+                "color_rgb": [7, 43, 71],
                 "color_tolerance": 15,
-                "search_rect": [9, 3, 30, 30],  # [x_offset, y_offset, width, height]
+                "search_rect": [9, 3, 30, 30],
                 "category_id": "personal_browsing",
                 "enabled": True
             }
@@ -705,19 +777,13 @@ def get_available_exe_patterns() -> List[str]:
     ]
 
 def validate_browser_profile(profile: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Validate a browser profile configuration.
-    
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
+    """Validate a browser profile configuration."""
     required_fields = ["name", "exe_pattern", "color_rgb", "search_rect", "category_id"]
     
     for field in required_fields:
         if field not in profile:
             return False, f"Missing required field: {field}"
     
-    # Validate color_rgb format
     color_rgb = profile["color_rgb"]
     if not isinstance(color_rgb, (list, tuple)) or len(color_rgb) != 3:
         return False, "color_rgb must be a list/tuple of 3 values [R, G, B]"
@@ -726,7 +792,6 @@ def validate_browser_profile(profile: Dict[str, Any]) -> Tuple[bool, str]:
         if not isinstance(color_val, int) or not (0 <= color_val <= 255):
             return False, "Each RGB value must be an integer between 0 and 255"
     
-    # Validate search_rect format
     search_rect = profile["search_rect"]
     if not isinstance(search_rect, (list, tuple)) or len(search_rect) != 4:
         return False, "search_rect must be a list/tuple of 4 values [x, y, width, height]"
@@ -735,17 +800,14 @@ def validate_browser_profile(profile: Dict[str, Any]) -> Tuple[bool, str]:
         if not isinstance(rect_val, int) or rect_val < 0:
             return False, "Each search_rect value must be a non-negative integer"
     
-    # Validate tolerance if present
     if "color_tolerance" in profile:
         tolerance = profile["color_tolerance"]
         if not isinstance(tolerance, int) or not (0 <= tolerance <= 255):
             return False, "color_tolerance must be an integer between 0 and 255"
     
-    # Validate exe_pattern
     if not isinstance(profile["exe_pattern"], str) or not profile["exe_pattern"].strip():
         return False, "exe_pattern must be a non-empty string"
     
-    # Validate name
     if not isinstance(profile["name"], str) or not profile["name"].strip():
         return False, "name must be a non-empty string"
     
@@ -753,9 +815,7 @@ def validate_browser_profile(profile: Dict[str, Any]) -> Tuple[bool, str]:
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     """Convert hex color string to RGB tuple."""
-    # Remove # if present
     hex_color = hex_color.lstrip('#')
-    # Convert to RGB
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
@@ -764,13 +824,12 @@ def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
 
 def get_default_search_rect_for_browser(exe_pattern: str) -> List[int]:
     """Get default search rectangle based on browser type."""
-    # These are starting points - users should adjust based on their setup
     defaults = {
-        "msedge.exe": [9, 3, 30, 30],      # Edge profile indicator location
-        "chrome.exe": [40, 8, 25, 25],     # Chrome profile avatar location  
-        "firefox.exe": [45, 10, 20, 20],   # Firefox profile area
-        "brave.exe": [40, 8, 25, 25],      # Similar to Chrome
-        "opera.exe": [35, 8, 25, 25],      # Opera profile area
-        "vivaldi.exe": [40, 8, 25, 25],    # Similar to Chrome
+        "msedge.exe": [9, 3, 30, 30],
+        "chrome.exe": [40, 8, 25, 25],     
+        "firefox.exe": [45, 10, 20, 20],   
+        "brave.exe": [40, 8, 25, 25],      
+        "opera.exe": [35, 8, 25, 25],      
+        "vivaldi.exe": [40, 8, 25, 25],    
     }
-    return defaults.get(exe_pattern, [10, 5, 25, 25])  # Generic default
+    return defaults.get(exe_pattern, [10, 5, 25, 25])

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Focus Monitor Agent (Window Title Tracking Version)
+Focus Monitor Agent (Window Title Tracking Version) - Modified for Browser Profile Daily Aggregation
 
 This script tracks the title and executable of the currently focused window
 to generate focus activity logs and daily summaries. It can capture screenshots
@@ -8,6 +8,12 @@ for certain applications and perform OCR on the images.
 Runs completely standalone and saves all files to the script's directory.
 Generates live summaries for the current day's activity.
 Detects and groups browser profiles for Microsoft Edge.
+
+Key Changes for Browser Profile Daily Aggregation:
+- Browser profile activities are excluded from 5-minute buckets
+- Browser profile activities are aggregated daily by category
+- 5-minute buckets only contain non-browser-profile activities
+- All other functionality preserved (OCR, focus scoring, classifications, etc.)
 
 NOTE: LLM processing has been moved to the dashboard for better user control.
 Browser profile configuration is now managed through the dashboard UI.
@@ -129,7 +135,10 @@ class FocusMonitorAgent:
         self.session_start_tag: str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.time_buckets: Dict[int, Dict[str, Any]] = {} # bucket_index: bucket_data
         
-        # NEW: Track bucket finalization state (simplified since no LLM processing)
+        # NEW: Daily browser profile aggregation
+        self.daily_browser_activities: Dict[str, Dict[str, Any]] = {}  # category_id -> aggregated data
+        
+        # Track bucket finalization state (simplified since no LLM processing)
         self.finalized_buckets: Set[int] = set()  # Track which buckets have been finalized
         self.current_bucket_index: Optional[int] = None  # Track current active bucket
 
@@ -149,7 +158,7 @@ class FocusMonitorAgent:
         self._load_browser_profiles()
 
         logger.info(
-            f"Initialized FocusMonitorAgent. Output Dir: {self.focus_logs_dir}, API URL: {self.api_url or 'Disabled'}"
+            f"Initialized FocusMonitorAgent with Browser Profile Daily Aggregation. Output Dir: {self.focus_logs_dir}, API URL: {self.api_url or 'Disabled'}"
         )
         logger.info("LLM processing disabled in agent - handled by dashboard for user control")
         logger.info(f"Loaded {len(self.browser_profiles)} browser profiles for color detection")
@@ -172,8 +181,8 @@ class FocusMonitorAgent:
                         if profile.get("enabled", True):  # Default to enabled if not specified
                             # Convert color_rgb and search_rect from lists to Tuples for consistency
                             processed_profile = profile.copy()
-                            processed_profile["color_rgb"] = Tuple(profile.get("color_rgb", [128, 128, 128]))
-                            processed_profile["search_rect"] = Tuple(profile.get("search_rect", [10, 5, 25, 25]))
+                            processed_profile["color_rgb"] = tuple(profile.get("color_rgb", [128, 128, 128]))
+                            processed_profile["search_rect"] = tuple(profile.get("search_rect", [10, 5, 25, 25]))
                             self.browser_profiles.append(processed_profile)
                     
                     self.last_profiles_load_time = time.time()
@@ -669,7 +678,7 @@ class FocusMonitorAgent:
             return None
 
     def _log_window_activity(self, window_info: Dict[str, Any], duration_seconds: int):
-        """Log focused window activity to a JSONL file."""
+        """Log focused window activity to a JSONL file and handle browser profile aggregation."""
         if duration_seconds <= 0: return
         try:
             # focus_logs_dir is already ensured by __init__
@@ -691,11 +700,15 @@ class FocusMonitorAgent:
 
             # Check for color profile match if it's a browser window
             hwnd = window_info.get("hwnd")
+            profile_category_id = ""
+            is_browser_profile_activity = False
+            
             if hwnd:
                 profile_category_id = self._check_color_profiles_for_window(
                     hwnd, window_info["exe"], window_info["title"]
                 )
                 if profile_category_id:
+                    is_browser_profile_activity = True
                     # Store the detected profile category in the log entry for later use
                     log_entry["detected_profile_category"] = profile_category_id
                     # Also update the app_name to reflect the detected category
@@ -706,7 +719,7 @@ class FocusMonitorAgent:
                     if matching_profile:
                         profile_name = matching_profile.get("name", profile_category_id)
                         log_entry["app_name"] = f"{os.path.basename(window_info['exe']).replace('.exe', '')} - {profile_name}"
-                        logger.info(f"🎯 CATEGORIZED: Window automatically categorized and logged as '{log_entry['app_name']}' with category '{profile_category_id}'")
+                        logger.info(f"🎯 BROWSER PROFILE: Window automatically categorized and logged as '{log_entry['app_name']}' with category '{profile_category_id}'")
 
             # Add OCR info if available from current capture or cache
             hwnd = window_info.get("hwnd")
@@ -724,6 +737,7 @@ class FocusMonitorAgent:
             # Clean up OCR timestamp cache if entry processed
             if hwnd in self.ocr_last_times: self.ocr_last_times.pop(hwnd, None)
 
+            # Always log to JSONL file for complete record
             with open(log_file_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
 
@@ -731,14 +745,52 @@ class FocusMonitorAgent:
             title_snippet = log_entry["title"][:60].replace("\n", " ") + ("..." if len(log_entry["title"]) > 60 else "")
             logger.info(f"Logged: {log_entry['app_name']} - '{title_snippet}' ({duration_seconds}s)")
 
-            # Update in-memory time bucket with this activity
-            self._update_time_bucket(log_entry) # Pass the full log_entry
+            # NEW: Handle browser profile daily aggregation vs 5-minute buckets
+            if is_browser_profile_activity:
+                self._update_daily_browser_aggregation(log_entry, profile_category_id)
+            else:
+                # Update in-memory time bucket with this activity (only non-browser profile activities)
+                self._update_time_bucket(log_entry) # Pass the full log_entry
 
         except Exception as e_log:
             logger.error(f"Error writing to log file {log_file_path}: {e_log}")
 
+    def _update_daily_browser_aggregation(self, log_entry_data: Dict[str, Any], category_id: str):
+        """Aggregate browser profile activities daily by category."""
+        try:
+            # Initialize category aggregation if not exists
+            if category_id not in self.daily_browser_activities:
+                self.daily_browser_activities[category_id] = {
+                    "category_id": category_id,
+                    "total_duration": 0,
+                    "titles": set(),
+                    "ocr_text": set(),
+                    "app_names": set(),
+                    "start_time": log_entry_data["timestamp"],
+                    "last_activity": log_entry_data["timestamp"],
+                    "activity_count": 0
+                }
+            
+            # Update aggregation
+            agg = self.daily_browser_activities[category_id]
+            agg["total_duration"] += log_entry_data.get("duration", 0)
+            agg["activity_count"] += 1
+            agg["last_activity"] = log_entry_data["timestamp"]
+            
+            if log_entry_data.get("title"):
+                agg["titles"].add(log_entry_data["title"])
+            if log_entry_data.get("ocr_text"):
+                agg["ocr_text"].add(log_entry_data["ocr_text"])
+            if log_entry_data.get("app_name"):
+                agg["app_names"].add(log_entry_data["app_name"])
+            
+            logger.debug(f"Updated daily browser aggregation for category '{category_id}': {agg['total_duration']}s total, {agg['activity_count']} activities")
+            
+        except Exception as e:
+            logger.error(f"Error updating daily browser aggregation: {e}")
+
     def _update_time_bucket(self, log_entry_data: Dict[str, Any]):
-        """Update the in-memory 5-minute bucket with a new log entry (NO LLM processing)."""
+        """Update the in-memory 5-minute bucket with a new log entry (NO LLM processing, excludes browser profiles)."""
         try:
             # Timestamp from log_entry is already UTC ISO format
             log_ts = datetime.datetime.fromisoformat(log_entry_data["timestamp"]).timestamp() # Convert to UNIX timestamp
@@ -774,11 +826,6 @@ class FocusMonitorAgent:
         bucket_data["apps"].add(log_entry_data.get("app_name", "Unknown")) # app_name includes profile if any
         if log_entry_data.get("title"): bucket_data["titles"].add(log_entry_data["title"])
         if log_entry_data.get("ocr_text"): bucket_data["ocr_text"].add(log_entry_data["ocr_text"])
-        
-        # If this log entry has a detected profile category from color detection, use it
-        if log_entry_data.get("detected_profile_category"):
-            bucket_data["category_id"] = log_entry_data["detected_profile_category"]
-            logger.debug(f"Setting bucket category to '{bucket_data['category_id']}' based on color profile detection")
 
     def _finalize_bucket(self, bucket_index: int):
         """Mark a bucket as finalized (no LLM processing in agent)."""
@@ -796,7 +843,7 @@ class FocusMonitorAgent:
         logger.info(f"Finalized data collection for bucket {bucket_index} ({bucket_data.get('start', '')}) - LLM processing deferred to dashboard")
 
     def _write_time_bucket_summary(self):
-        """Write the current session's time bucket data to a JSON file (no LLM summaries)."""
+        """Write the current session's time bucket data to a JSON file (no LLM summaries, excludes browser profiles)."""
         if not self.time_buckets:
             logger.info("No time buckets to write for current session.")
             return
@@ -820,9 +867,37 @@ class FocusMonitorAgent:
         try:
             with open(bucket_file_path, "w", encoding="utf-8") as f:
                 json.dump(serializable_buckets_list, f, indent=2)
-            logger.info(f"Wrote {len(serializable_buckets_list)} time bucket data entries to {bucket_file_path} (summaries to be generated by dashboard)")
+            logger.info(f"Wrote {len(serializable_buckets_list)} time bucket data entries to {bucket_file_path} (summaries to be generated by dashboard, browser profiles excluded)")
         except Exception as e_write_bucket:
             logger.error(f"Error writing time bucket data file {bucket_file_path}: {e_write_bucket}")
+
+    def _write_daily_browser_aggregation(self):
+        """Write the current day's browser profile aggregations to a JSON file."""
+        if not self.daily_browser_activities:
+            logger.info("No browser profile activities to write for current day.")
+            return
+
+        browser_file_path = self.focus_logs_dir / f"daily_browser_activities_{self.today}.json"
+        
+        serializable_browser_data = []
+        for category_id, agg_data in self.daily_browser_activities.items():
+            serializable_browser_data.append({
+                "category_id": category_id,
+                "total_duration": agg_data["total_duration"],
+                "titles": sorted(list(agg_data.get("titles", set()))),
+                "ocr_text": sorted(list(agg_data.get("ocr_text", set()))),
+                "app_names": sorted(list(agg_data.get("app_names", set()))),
+                "start_time": agg_data["start_time"],
+                "last_activity": agg_data["last_activity"],
+                "activity_count": agg_data["activity_count"]
+            })
+
+        try:
+            with open(browser_file_path, "w", encoding="utf-8") as f:
+                json.dump(serializable_browser_data, f, indent=2)
+            logger.info(f"Wrote {len(serializable_browser_data)} daily browser profile aggregations to {browser_file_path}")
+        except Exception as e_write_browser:
+            logger.error(f"Error writing daily browser aggregation file {browser_file_path}: {e_write_browser}")
 
     def _generate_daily_summary(self, date_to_summarize: Optional[str] = None):
         """
@@ -831,6 +906,10 @@ class FocusMonitorAgent:
         """
         target_date_str = date_to_summarize if date_to_summarize else self.today
         logger.info(f"Generating daily summary for {target_date_str}...")
+
+        # Write browser aggregations before generating summary
+        if target_date_str == self.today:
+            self._write_daily_browser_aggregation()
 
         # Attempt to generate (or load if already generated by dashboard) the base summary
         base_summary_dict = None
@@ -1085,8 +1164,8 @@ class FocusMonitorAgent:
             plt.close() # Close the figure to free memory
 
     async def run_agent_loop(self, check_interval_s: int = 5):
-        """The main agent loop: tracks focused window and manages summaries."""
-        logger.info(f"Starting Focus Monitor agent loop. Log check interval: {check_interval_s}s")
+        """The main agent loop: tracks focused window and manages summaries with browser profile daily aggregation."""
+        logger.info(f"Starting Focus Monitor agent loop with browser profile daily aggregation. Log check interval: {check_interval_s}s")
         self.window_start_time = time.time()
         # Ensure summary runs on first suitable check if interval suggests it
         self.last_summary_time = time.time() - self.summary_interval 
@@ -1106,6 +1185,7 @@ class FocusMonitorAgent:
                         
                         self._generate_daily_summary() # Will use self.today
                         self._write_time_bucket_summary() # Write current session buckets
+                        self._write_daily_browser_aggregation() # Write browser aggregations
                         self.last_summary_time = time.time()
                     
                     # Sleep until next check, accounting for processing time
@@ -1125,17 +1205,19 @@ class FocusMonitorAgent:
                     
                     self._generate_daily_summary(self.today) # Final summary for the day that just ended
                     self._write_time_bucket_summary() # Write out buckets for the session that just ended with the day
+                    self._write_daily_browser_aggregation() # Write out browser aggregations for the day that just ended
                     
                     # Reset for the new day
                     self.today = current_utc_date_str
                     self.session_start_time = time.time() # New session starts now
                     self.session_start_tag = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     self.time_buckets = {} # Clear buckets for the new session
+                    self.daily_browser_activities = {} # Clear daily browser aggregation for new day
                     self.finalized_buckets = set() # Clear finalized buckets tracking
                     self.current_bucket_index = None # Reset current bucket tracking
                     self.last_window_info = None # Treat as fresh start for window tracking
                     self.window_start_time = time.time()
-                    logger.info(f"Updated current tracking date to {self.today}. New session tag: {self.session_start_tag}")
+                    logger.info(f"Updated current tracking date to {self.today}. New session tag: {self.session_start_tag}. Browser aggregation reset.")
 
                 # Get current focused window details
                 current_focused_win_details = self._get_focused_window_details()
@@ -1173,6 +1255,7 @@ class FocusMonitorAgent:
                     
                     self._generate_daily_summary() # Uses self.today
                     self._write_time_bucket_summary() # Writes current session's buckets
+                    self._write_daily_browser_aggregation() # Writes current day's browser aggregations
                     self.last_summary_time = time.time()
 
                 # Sleep until next interval, accounting for processing time in this iteration
@@ -1201,12 +1284,13 @@ class FocusMonitorAgent:
         
         self._generate_daily_summary()  # Generate final summary for the last active day
         self._write_time_bucket_summary() # Write out any remaining buckets for the session
+        self._write_daily_browser_aggregation() # Write out any remaining browser aggregations
         logger.info("Focus Monitor agent stopped.")
 
 
 async def main_async_entrypoint():
-    """Parses arguments and starts the FocusMonitorAgent."""
-    parser = argparse.ArgumentParser(description="Focus Monitor Agent (Window Tracking)")
+    """Parses arguments and starts the FocusMonitorAgent with browser profile daily aggregation."""
+    parser = argparse.ArgumentParser(description="Focus Monitor Agent with Browser Profile Daily Aggregation (Window Tracking)")
     parser.add_argument("--output-dir", "-o", type=str, default=None,
                         help="Optional directory to store logs (defaults to script directory).")
     parser.add_argument("--api-url", "-a", type=str, default=None,
@@ -1253,6 +1337,7 @@ async def main_async_entrypoint():
         logger.info("Forcing initial daily summary generation as per --force-summary-on-start...")
         agent_instance._generate_daily_summary() # For current day (self.today)
         agent_instance._write_time_bucket_summary() # Write any buckets from very short startup
+        agent_instance._write_daily_browser_aggregation() # Write any browser aggregations from startup
         agent_instance.last_summary_time = time.time() # Reset summary timer
 
     # Create tasks for the agent loop and backend status check (if API is used)

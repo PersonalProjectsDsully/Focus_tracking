@@ -816,21 +816,73 @@ def display_category_manager():
 # --- Time Bucket Summaries Page ---
 def display_time_bucket_summaries():
     st.title("📝 5-Minute Summaries & Feedback")
+    st.caption("Note: Browser profile activities are excluded from 5-minute buckets and aggregated daily instead")
+    
     dates = load_available_dates()
-    if not dates: st.error("No data in focus_logs directory."); st.stop()
+    if not dates: 
+        st.error("No data in focus_logs directory.")
+        st.stop()
+    
     selected_date = st.selectbox("Select a date", dates, key="summaries_date_select")
 
-    official_buckets = load_time_buckets_for_date(selected_date) # Returns list of dicts with 'session_tag'
+    official_buckets = load_time_buckets_for_date(selected_date)
     personal_notes_data = load_block_feedback()
     categories = load_categories()
     cat_map = {cat.get("id"): cat for cat in categories}
 
+    # Show browser profile activities for context
+    browser_activities = load_daily_browser_activities(selected_date)
+    if browser_activities:
+        st.subheader("🌐 Browser Profile Activities (Daily Aggregated)")
+        st.caption("These activities are automatically categorized and excluded from 5-minute buckets below")
+        
+        browser_summary_data = []
+        for activity in browser_activities:
+            cat_name = cat_map.get(activity.get("category_id", ""), {}).get("name", "Uncategorized")
+            duration_minutes = round(activity.get("total_duration", 0) / 60, 1)
+            
+            browser_summary_data.append({
+                "Category": cat_name,
+                "Duration (min)": duration_minutes,
+                "Activities": activity.get("activity_count", 0),
+                "Unique Titles": len(activity.get("titles", []))
+            })
+        
+        if browser_summary_data:
+            df_browser_summary = pd.DataFrame(browser_summary_data)
+            st.dataframe(df_browser_summary, use_container_width=True)
+        
+        with st.expander("View Detailed Browser Profile Activities"):
+            for activity in browser_activities:
+                cat_name = cat_map.get(activity.get("category_id", ""), {}).get("name", "Uncategorized")
+                duration_minutes = round(activity.get("total_duration", 0) / 60, 1)
+                
+                st.markdown(f"**{cat_name}** - {duration_minutes} minutes")
+                
+                if activity.get("titles"):
+                    st.markdown("*Sample Window Titles:*")
+                    for title in list(activity["titles"])[:5]:  # Show first 5
+                        st.text(f"  • {title[:60]}{'...' if len(title) > 60 else ''}")
+                    if len(activity["titles"]) > 5:
+                        st.caption(f"... and {len(activity['titles']) - 5} more")
+                
+                st.markdown("---")
+        
+        st.markdown("---")
+    
     if not official_buckets:
-        st.info(f"No 5-minute summary blocks found for {selected_date}."); return
+        if browser_activities:
+            st.info(f"No 5-minute summary blocks found for {selected_date}, but browser profile activities are available above.")
+        else:
+            st.info(f"No 5-minute summary blocks found for {selected_date}.")
+        return
+
+    st.subheader("📊 5-Minute Activity Buckets (Non-Browser-Profile Activities)")
+    st.caption(f"Found {len(official_buckets)} five-minute blocks containing regular activities")
 
     show_uncategorized_only = st.checkbox("Filter: Show only uncategorized entries", False)
     
-    # Category filter (if not showing only uncategorized)
+    # Category filter
     active_category_filter = "All Categories"
     if categories and not show_uncategorized_only:
         cat_options = ["All Categories", "Uncategorized"] + [cat.get("name") for cat in categories]
@@ -842,29 +894,39 @@ def display_time_bucket_summaries():
         for b in official_buckets:
             cat_name = cat_map.get(b.get("category_id"), {}).get("name", "Uncategorized")
             counts[cat_name] = counts.get(cat_name, 0) + 1
-        st.subheader("Summary Blocks by Category")
-        cols = st.columns(min(len(counts), 5)) # Max 5 columns for metrics
+        
+        st.subheader("5-Minute Blocks by Category")
+        cols = st.columns(min(len(counts), 5))
         for i, (name, count) in enumerate(counts.items()):
-            if count > 0: cols[i % 5].metric(name, count)
+            if count > 0: 
+                cols[i % 5].metric(name, count)
+        
         if counts["Uncategorized"] > 0:
-             st.warning(f"{counts['Uncategorized']} entries are uncategorized. Use filter above.")
+             st.warning(f"{counts['Uncategorized']} 5-minute blocks are uncategorized. Use filter above to focus on them.")
         st.markdown("---")
 
-
+    # Display individual buckets
+    displayed_count = 0
     for idx, bucket in enumerate(official_buckets):
         bucket_start_iso = bucket["start"]
-        session_tag = bucket.get("session_tag", "unknown_session") # Crucial for targeting correct file
+        session_tag = bucket.get("session_tag", "unknown_session")
         current_cat_id = bucket.get("category_id", "")
         current_cat_name = cat_map.get(current_cat_id, {}).get("name", "Uncategorized")
 
-        if show_uncategorized_only and current_cat_id: continue
+        # Apply filters
+        if show_uncategorized_only and current_cat_id: 
+            continue
         if not show_uncategorized_only and active_category_filter != "All Categories":
-            if active_category_filter == "Uncategorized" and current_cat_name != "Uncategorized": continue
-            if active_category_filter != "Uncategorized" and current_cat_name != active_category_filter: continue
+            if active_category_filter == "Uncategorized" and current_cat_name != "Uncategorized": 
+                continue
+            if active_category_filter != "Uncategorized" and current_cat_name != active_category_filter: 
+                continue
         
+        displayed_count += 1
         start_dt_fmt = pd.to_datetime(bucket_start_iso).strftime('%H:%M')
         exp_title = f"{start_dt_fmt} (Session: {session_tag}) - [{current_cat_name}]"
-        if not current_cat_id: exp_title += " ⚠️"
+        if not current_cat_id: 
+            exp_title += " ⚠️"
 
         with st.expander(exp_title):
             # Category selection
@@ -872,63 +934,126 @@ def display_time_bucket_summaries():
                 st.markdown("**Activity Category:**")
                 cat_names_options = ["Uncategorized"] + [c.get("name") for c in categories]
                 cat_ids_options = [""] + [c.get("id") for c in categories]
-                try: current_sel_idx = cat_ids_options.index(current_cat_id)
-                except ValueError: current_sel_idx = 0 # Default to Uncategorized
+                try: 
+                    current_sel_idx = cat_ids_options.index(current_cat_id)
+                except ValueError: 
+                    current_sel_idx = 0
 
-                new_cat_name_sel = st.selectbox("Set Category:", cat_names_options, index=current_sel_idx, key=f"cat_sel_{idx}_{bucket_start_iso}")
+                new_cat_name_sel = st.selectbox(
+                    "Set Category:", 
+                    cat_names_options, 
+                    index=current_sel_idx, 
+                    key=f"cat_sel_{idx}_{bucket_start_iso}"
+                )
                 new_cat_id_sel = cat_ids_options[cat_names_options.index(new_cat_name_sel)]
 
                 if new_cat_id_sel != current_cat_id:
                     if st.button("Update Category", key=f"upd_cat_btn_{idx}_{bucket_start_iso}"):
                         if update_bucket_category_in_file(session_tag, bucket_start_iso, new_cat_id_sel):
-                            st.success("Category updated!"); time.sleep(1); st.rerun()
+                            st.success("Category updated!")
+                            time.sleep(1)
+                            st.rerun()
             
             st.markdown("**Official LLM Summary:**")
             st.caption(bucket.get("summary", "_No official summary._"))
 
-            # LLM Actions: Refine, Re-Generate
-            st.markdown("**LLM Summary Actions (Modifies Log File):**")
+            # Show what activities are in this bucket
+            if bucket.get("titles") or bucket.get("apps"):
+                st.markdown("**Activities in this 5-minute block:**")
+                if bucket.get("apps"):
+                    st.write("*Applications:*", ", ".join(list(bucket.get("apps", []))))
+                if bucket.get("titles"):
+                    st.write("*Window Titles:*")
+                    for title in list(bucket.get("titles", []))[:3]:  # Show first 3
+                        st.text(f"  • {title[:50]}{'...' if len(title) > 50 else ''}")
+                    if len(bucket.get("titles", [])) > 3:
+                        st.caption(f"... and {len(bucket.get('titles', [])) - 3} more titles")
+
+            # LLM Actions
+            st.markdown("**LLM Summary Actions:**")
             llm_action_cols = st.columns(2)
-            user_feedback_for_refine = st.text_area("Your feedback/details for LLM refinement:", key=f"feedback_llm_{idx}_{bucket_start_iso}", height=75)
+            user_feedback_for_refine = st.text_area(
+                "Your feedback/details for LLM refinement:", 
+                key=f"feedback_llm_{idx}_{bucket_start_iso}", 
+                height=75
+            )
 
             if llm_action_cols[0].button("Refine LLM Summary", key=f"refine_btn_{idx}_{bucket_start_iso}"):
                 if user_feedback_for_refine.strip():
                     with st.spinner("Refining summary with LLM..."):
-                        # Adjusted to ignore the 4th return value (prompt)
                         refined_sum, new_cid, sugg_cat, _ = refine_summary_with_llm(
                             bucket.get("summary",""), user_feedback_for_refine, current_cat_id, True)
                         if refined_sum is not None:
                             update_bucket_summary_in_file(session_tag, bucket_start_iso, refined_sum)
-                            if new_cid != current_cat_id : update_bucket_category_in_file(session_tag, bucket_start_iso, new_cid)
-                            # Handle sugg_cat display or auto-creation logic if desired
-                            st.success("Summary refined!"); time.sleep(1); st.rerun()
-                        else: st.error("LLM refinement failed.")
-                else: st.warning("Provide feedback text to refine.")
+                            if new_cid != current_cat_id: 
+                                update_bucket_category_in_file(session_tag, bucket_start_iso, new_cid)
+                            st.success("Summary refined!")
+                            time.sleep(1)
+                            st.rerun()
+                        else: 
+                            st.error("LLM refinement failed.")
+                else: 
+                    st.warning("Provide feedback text to refine.")
 
             if llm_action_cols[1].button("Re-Generate Original LLM Summary", key=f"regen_btn_{idx}_{bucket_start_iso}"):
                 with st.spinner("Re-generating summary with LLM..."):
-                     # Adjusted to ignore the 4th return value (prompt)
                     new_sum, new_cid, sugg_cat, _ = generate_summary_from_raw_with_llm(
                         bucket.get("titles",[]), bucket.get("ocr_text",[]), True)
                     if new_sum is not None:
                         update_bucket_summary_in_file(session_tag, bucket_start_iso, new_sum)
-                        if new_cid : update_bucket_category_in_file(session_tag, bucket_start_iso, new_cid)
-                        st.success("Summary re-generated!"); time.sleep(1); st.rerun()
-                    else: st.error("LLM re-generation failed.")
+                        if new_cid: 
+                            update_bucket_category_in_file(session_tag, bucket_start_iso, new_cid)
+                        st.success("Summary re-generated!")
+                        time.sleep(1)
+                        st.rerun()
+                    else: 
+                        st.error("LLM re-generation failed.")
             
             # Personal Notes
             st.markdown("**Personal Note (Private):**")
             personal_note_key = f"note_{idx}_{bucket_start_iso}"
             current_personal_note = personal_notes_data.get(bucket_start_iso, "")
-            new_personal_note = st.text_area("Your private note for this block:", value=current_personal_note, key=personal_note_key, height=75)
+            new_personal_note = st.text_area(
+                "Your private note for this 5-minute block:", 
+                value=current_personal_note, 
+                key=personal_note_key, 
+                height=75
+            )
             
             note_cols = st.columns(2)
             if note_cols[0].button("Save Personal Note", key=f"save_note_{idx}_{bucket_start_iso}"):
                 personal_notes_data[bucket_start_iso] = new_personal_note.strip()
-                if save_block_feedback(personal_notes_data): st.success("Personal note saved!"); time.sleep(0.5); st.rerun()
+                if save_block_feedback(personal_notes_data): 
+                    st.success("Personal note saved!")
+                    time.sleep(0.5)
+                    st.rerun()
+            
             if current_personal_note and note_cols[1].button("Delete Personal Note", key=f"del_note_{idx}_{bucket_start_iso}"):
-                if bucket_start_iso in personal_notes_data: del personal_notes_data[bucket_start_iso]
-                if save_block_feedback(personal_notes_data): st.success("Personal note deleted!"); time.sleep(0.5); st.rerun()
+                if bucket_start_iso in personal_notes_data: 
+                    del personal_notes_data[bucket_start_iso]
+                if save_block_feedback(personal_notes_data): 
+                    st.success("Personal note deleted!")
+                    time.sleep(0.5)
+                    st.rerun()
+
+    if displayed_count == 0:
+        st.info(f"No 5-minute blocks match the current filter criteria.")
+    
+    # Summary info
+    st.markdown("---")
+    st.info(f"""
+    **Summary for {selected_date}:**
+    - 🌐 Browser profile activities: {len(browser_activities)} categories (daily aggregated)
+    - 📊 5-minute activity blocks: {len(official_buckets)} blocks (regular activities only)
+    - 📝 Personal notes: {len([k for k in personal_notes_data.keys() if k.startswith(selected_date)])} notes
+    """)
+    
+    st.markdown("""
+    **How this works:**
+    - Browser activities that match configured profiles are automatically categorized and aggregated for the entire day
+    - Regular activities (non-browser-profile) are organized into 5-minute blocks for detailed analysis and note-taking
+    - This separation allows for both automatic categorization and detailed manual review
+    """)
 
 
 
@@ -1342,17 +1467,97 @@ def display_dashboard():
         st.stop()
 
     # --- Summary Metrics ---
-    d_col1, d_col2, d_col3 = st.columns(3)
-    d_col1.metric(
-        "🕒 Total Tracked Time", f"{daily_summary_data.get('totalTime', 0) // 60} min"
-    )
+    d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+    
+    total_time_minutes = daily_summary_data.get('totalTime', 0) // 60
+    d_col1.metric("🕒 Total Tracked Time", f"{total_time_minutes} min")
+    
+    # Calculate browser profile time
+    browser_activities = daily_summary_data.get("browserProfileActivities", [])
+    browser_time_minutes = sum(activity.get("total_duration", 0) for activity in browser_activities) // 60
+    d_col2.metric("🌐 Browser Profile Time", f"{browser_time_minutes} min")
+    
+    # Calculate non-browser time
+    non_browser_time_minutes = total_time_minutes - browser_time_minutes
+    d_col3.metric("💻 Regular Activity Time", f"{non_browser_time_minutes} min")
+    
+    # Browser profile count
+    d_col4.metric("🎯 Browser Profiles Used", len(browser_activities))
 
-    # --- NEW: Category Analysis ---
+    # --- NEW: Browser Profile Daily Aggregation Display ---
+    if browser_activities:
+        st.subheader("🌐 Daily Browser Profile Activities")
+        
+        # Load categories for display
+        categories = load_categories()
+        cat_id_to_name = {cat.get("id", ""): cat.get("name", "Unknown") for cat in categories}
+        
+        # Create a visualization of browser activities
+        browser_viz_data = []
+        for activity in browser_activities:
+            category_name = cat_id_to_name.get(activity.get("category_id", ""), "Uncategorized")
+            duration_minutes = activity.get("total_duration", 0) / 60
+            
+            browser_viz_data.append({
+                "Category": category_name,
+                "Duration (min)": round(duration_minutes, 1),
+                "Activity Count": activity.get("activity_count", 0),
+                "App Names": ", ".join(list(activity.get("app_names", [])))[:50] + "..." if len(", ".join(list(activity.get("app_names", [])))) > 50 else ", ".join(list(activity.get("app_names", []))),
+                "Sample Titles": len(activity.get("titles", []))
+            })
+        
+        if browser_viz_data:
+            df_browser = pd.DataFrame(browser_viz_data)
+            
+            # Create pie chart for browser profile time distribution
+            if len(browser_viz_data) > 1:
+                fig_browser_pie = px.pie(
+                    df_browser,
+                    values="Duration (min)",
+                    names="Category",
+                    title="Browser Profile Time Distribution",
+                    hole=0.4
+                )
+                
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    st.plotly_chart(fig_browser_pie, use_container_width=True)
+                
+                with col2:
+                    st.dataframe(df_browser, use_container_width=True)
+            else:
+                st.dataframe(df_browser, use_container_width=True)
+            
+            # Detailed browser activities
+            with st.expander("🔍 Detailed Browser Profile Activities"):
+                for i, activity in enumerate(browser_activities):
+                    category_name = cat_id_to_name.get(activity.get("category_id", ""), "Uncategorized")
+                    duration_minutes = round(activity.get("total_duration", 0) / 60, 1)
+                    
+                    st.markdown(f"**{category_name}** - {duration_minutes} minutes ({activity.get('activity_count', 0)} activities)")
+                    
+                    if activity.get("titles"):
+                        titles_sample = list(activity["titles"])[:10]  # Show first 10 titles
+                        st.markdown("*Sample Window Titles:*")
+                        for title in titles_sample:
+                            st.text(f"  • {title[:80]}{'...' if len(title) > 80 else ''}")
+                        if len(activity["titles"]) > 10:
+                            st.caption(f"... and {len(activity['titles']) - 10} more titles")
+                    
+                    if activity.get("app_names"):
+                        st.markdown(f"*App Names:* {', '.join(list(activity['app_names']))}")
+                    
+                    st.markdown("---")
+    else:
+        st.info("No browser profile activities detected for this date.")
+
+    # --- Category Analysis for 5-Minute Buckets ---
     categories = load_categories()
     all_buckets = load_time_buckets_for_date(selected_date)
 
     if categories and all_buckets:
-        st.subheader("🏆 Activity by Category")
+        st.subheader("🏆 5-Minute Activity Buckets by Category")
+        st.caption("Note: Browser profile activities are excluded from time buckets and shown separately above")
 
         # Create category chart using the imported function
         fig_category = create_category_chart(all_buckets, categories)
@@ -1411,94 +1616,101 @@ def display_dashboard():
                     "Duration (min)", ascending=False
                 )
 
-                st.subheader("Category Time Distribution")
+                st.subheader("5-Minute Bucket Category Time Distribution")
                 st.dataframe(category_totals, use_container_width=True)
 
-                with st.expander("View Detailed Category Timeline"):
+                with st.expander("View Detailed 5-Minute Bucket Timeline"):
                     st.dataframe(
                         df_categories.sort_values("Start Time"),
                         use_container_width=True,
                     )
         else:
-            st.info("No category data available for visualization.")
+            st.info("No 5-minute bucket category data available for visualization.")
     elif categories:
-        st.info("No time bucket data available for category analysis.")
+        st.info("No 5-minute bucket data available for category analysis.")
     else:
         st.info(
             "No categories defined. Go to the 'Activity Categories Manager' tab to create categories."
         )
 
-    st.subheader("🧠 Time Distribution by Application/Activity (Post-Labeling)")
+    # --- Application Breakdown (Now includes Browser Profiles) ---
+    st.subheader("🧠 Time Distribution by Application/Activity")
+    st.caption("This includes both regular activities and browser profile aggregations")
+    
     app_breakdown_data = daily_summary_data.get("appBreakdown", [])
     if app_breakdown_data:
-        # Use the charts module function
+        # Separate browser profile activities from regular activities for display
+        browser_profile_apps = [app for app in app_breakdown_data if app.get("isBrowserProfile", False)]
+        regular_apps = [app for app in app_breakdown_data if not app.get("isBrowserProfile", False)]
+        
+        # Create pie chart with both types
         fig_pie_main = create_pie_chart(app_breakdown_data)
         st.plotly_chart(fig_pie_main, use_container_width=True)
 
+        # Create detailed breakdown table
         df_app_top = pd.DataFrame(
             [
                 {
                     "Activity/Application": app.get("appName", "N/A"),
+                    "Type": "Browser Profile" if app.get("isBrowserProfile", False) else "Regular Activity",
                     "Time (min)": app.get("timeSpent", 0) // 60,
                     "Percentage": f"{app.get('percentage', 0):.1f}%",
+                    "Category": app.get("categoryId", "N/A") if app.get("isBrowserProfile") else "N/A",
+                    "Activity Count": app.get("activityCount", "N/A") if app.get("isBrowserProfile") else "N/A"
                 }
-                for app in app_breakdown_data[:10]
+                for app in app_breakdown_data[:15]  # Show top 15
             ]
-        )  # Show top 10 labeled activities
+        )
         st.dataframe(df_app_top, use_container_width=True)
+        
+        # Summary statistics
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Regular Activities", len(regular_apps))
+        col2.metric("Browser Profile Activities", len(browser_profile_apps))
+        col3.metric("Total Activities", len(app_breakdown_data))
+        
     else:
         st.info("No application usage data available for this date in the summary.")
 
-    st.subheader("🌐 Browser Usage Analysis (Labeled)")
-    # Use the charts module function
-    fig_browser_main = create_browser_chart(app_breakdown_data)
+    # --- Browser Usage Analysis (Regular Browser Usage - not profiles) ---
+    st.subheader("🌐 Regular Browser Usage Analysis")
+    st.caption("This shows browser usage that was not automatically categorized by profiles")
+    
+    # Filter out browser profile activities to show only regular browser usage
+    regular_browser_data = [app for app in app_breakdown_data if not app.get("isBrowserProfile", False)]
+    fig_browser_main = create_browser_chart(regular_browser_data)
     if fig_browser_main:
         st.plotly_chart(fig_browser_main, use_container_width=True)
     else:
-        st.info("No browser usage detected or included in the summary for this date.")
+        st.info("No regular browser usage detected (all browser activity was categorized by profiles).")
 
-    with st.expander("📄 View Raw Focus Log Entries (Unlabeled Original Data)"):
-        raw_log_df = load_log_entries(selected_date)  # Load raw, pre-labeling
+    # --- Raw Log Entries ---
+    with st.expander("📄 View Raw Focus Log Entries (All Activities)"):
+        raw_log_df = load_log_entries(selected_date)
         if not raw_log_df.empty:
-            # Create a copy to avoid modifying the original DataFrame from cache
             df_to_display = raw_log_df.copy()
 
-            # Define the desired final column names and their original sources
-            # Ensure 'timestamp' is the primary source for the 'Time' column
-            final_columns_map = {
-                "Time": "timestamp",  # This will be formatted
-                "Original App Name": "app_name",
-                "Original Window Title": "title",
-                "Duration (s)": "duration",
-            }
-
-            # Columns that must exist in raw_log_df for this section to work
             required_raw_cols = ["timestamp", "app_name", "title", "duration"]
 
             if all(col in df_to_display.columns for col in required_raw_cols):
-                # Format the 'timestamp' to a readable 'Time' string IN A NEW COLUMN
                 df_to_display["Formatted Time"] = pd.to_datetime(
                     df_to_display["timestamp"], errors="coerce"
                 ).dt.strftime("%Y-%m-%d %H:%M:%S")
 
-                # Select and rename:
-                # Create a new DataFrame with only the columns we want, renaming them.
-                # This avoids duplicate column issues.
                 display_data = {}
-                if (
-                    "Formatted Time" in df_to_display.columns
-                ):  # Check if conversion was successful
+                if "Formatted Time" in df_to_display.columns:
                     display_data["Time"] = df_to_display["Formatted Time"]
                 if "app_name" in df_to_display.columns:
-                    display_data["Original App Name"] = df_to_display["app_name"]
+                    display_data["App Name"] = df_to_display["app_name"]
                 if "title" in df_to_display.columns:
-                    display_data["Original Window Title"] = df_to_display["title"]
+                    display_data["Window Title"] = df_to_display["title"]
                 if "duration" in df_to_display.columns:
                     display_data["Duration (s)"] = df_to_display["duration"]
+                if "detected_profile_category" in df_to_display.columns:
+                    display_data["Profile Category"] = df_to_display["detected_profile_category"].fillna("N/A")
 
                 final_display_df = pd.DataFrame(display_data)
 
-                # Sort by the 'Time' column (which is now uniquely named and formatted)
                 if "Time" in final_display_df.columns:
                     final_display_df = final_display_df.sort_values(
                         "Time", ascending=False
@@ -1515,8 +1727,8 @@ def display_dashboard():
         else:
             st.info("No raw log entries available for this date.")
 
-    # Simplified feedback view on dashboard - directs to Summaries tab
-    st.subheader("📝 Quick View: Recent Personal Notes for Blocks")
+    # --- Personal Notes Quick View ---
+    st.subheader("📝 Quick View: Recent Personal Notes for 5-Minute Blocks")
     dashboard_personal_notes = load_block_feedback()
     notes_for_selected_date = {
         k: v for k, v in dashboard_personal_notes.items() if k.startswith(selected_date)
@@ -1525,30 +1737,38 @@ def display_dashboard():
         st.caption(
             "Last 3 personal notes for this date (full management on '📝 Summaries' tab):"
         )
-        for ts, note_text in list(notes_for_selected_date.items())[
-            -3:
-        ]:  # Show most recent 3
+        for ts, note_text in list(notes_for_selected_date.items())[-3:]:
             st.caption(
                 f"_{pd.to_datetime(ts).strftime('%H:%M')}_: {note_text[:70]}{'...' if len(note_text) > 70 else ''}"
             )
     else:
         st.info(
-            "No personal notes recorded for this date yet. Use the '📝 Summaries' tab to add notes and manage official summaries."
+            "No personal notes recorded for this date yet. Use the '📝 Summaries' tab to add notes."
         )
 
     st.markdown("---")
     st.markdown(
         """
-    ### About Focus Monitor
-    This dashboard displays data collected by the Focus Monitor agent. The agent tracks your active windows and applications to help you understand your computer usage patterns.
-    - **Labels**: Use the '🏷 Activity Label Editor' tab to categorize your time.
-    - **Summaries**: Use the '📝 Summaries' tab to review, note, and refine 5-minute block summaries.
-    - **Categories**: Use the '🏆 Activity Categories Manager' tab to define high-level activity categories.
+    ### About Focus Monitor with Browser Profile Daily Aggregation
+    This dashboard displays data collected by the Focus Monitor agent with new browser profile daily aggregation:
     
-    To generate data:
-    1. Ensure the Focus Monitor agent (`standalone_focus_monitor.py`) is running in the background.
-    2. Use your computer normally. Data is logged to the `focus_logs` directory.
-    3. Refresh this dashboard to view updated statistics and summaries.
+    **Key Features:**
+    - **Browser Profile Detection**: Automatically categorizes browser windows based on visual color detection
+    - **Daily Aggregation**: Browser profile activities are grouped by category for the entire day
+    - **5-Minute Buckets**: Regular (non-browser-profile) activities are still organized in 5-minute time buckets
+    - **Unified View**: See both regular activities and browser profile aggregations in one place
+    
+    **How it works:**
+    1. The agent detects browser profile colors and automatically categorizes matching windows
+    2. Browser profile activities accumulate daily by category (no 5-minute splitting)
+    3. Regular activities continue to be organized in 5-minute buckets for detailed analysis
+    4. The dashboard shows both views: daily browser aggregations and detailed 5-minute buckets
+    
+    **Navigation:**
+    - **Labels**: Use the '🏷 Activity Label Editor' tab to categorize regular activities
+    - **Browser Profiles**: Use the '🌐 Browser Profiles' tab to configure automatic browser categorization
+    - **Summaries**: Use the '📝 Summaries' tab to review 5-minute block summaries (browser profiles excluded)
+    - **Categories**: Use the '🏆 Activity Categories Manager' tab to define activity categories
     """
     )
 
