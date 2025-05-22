@@ -8,6 +8,10 @@ for certain applications and perform OCR on the images.
 Runs completely standalone and saves all files to the script's directory.
 Generates live summaries for the current day's activity.
 Detects and groups browser profiles for Microsoft Edge.
+
+NOTE: LLM processing has been moved to the dashboard for better user control.
+Browser profile configuration is now managed through the dashboard UI.
+The agent now focuses purely on data collection and profile detection.
 """
 
 import argparse
@@ -28,6 +32,7 @@ import numpy as np  # Add this import for array operations with image data
 warnings.filterwarnings("ignore", category=UserWarning, module="streamlit")
 warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
 warnings.filterwarnings("ignore", message=".*Session state does not function.*")
+
 # Attempt to import Tesseract and Pillow for OCR; fail gracefully if not present.
 try:
     import pytesseract
@@ -54,50 +59,25 @@ except ImportError:
 
 # Get the directory where this script is located and add parent to path for dashboard imports
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-# Assuming project structure: project_root/dashboard/ and project_root/standalone_focus_monitor.py
-# or project_root/src/dashboard/ and project_root/src/standalone_focus_monitor.py
-# If dashboard is a sibling directory:
-# sys.path.append(str(SCRIPT_DIR.parent))
-# If dashboard is a child of a common 'src' or 'app' directory:
-# sys.path.append(str(SCRIPT_DIR.parent.parent)) # Adjust based on actual structure
 
 # --- Conditional import for dashboard utilities ---
-# This setup assumes 'dashboard' is a package discoverable by Python.
-# If 'standalone_focus_monitor.py' is inside a project with a 'dashboard' sibling directory,
-# and the project root is in PYTHONPATH, or if you run python -m standalone_focus_monitor from root,
-# this should work.
+# Only import data_utils for basic functionality, not LLM utils
 DASHBOARD_UTILS_AVAILABLE = False
 try:
-    # Ensure the dashboard directory (or its parent if dashboard is a package) is in sys.path
-    # This line is a common pattern but might need adjustment based on your project structure.
-    # If focus_monitor_dashboard.py and standalone_focus_monitor.py are siblings,
-    # and dashboard is a directory containing __init__.py, data_utils.py, etc.
-    # then `from dashboard.data_utils ...` should work if the parent of these files is in PYTHONPATH.
-    
-    # For simplicity, if they are siblings, and 'dashboard' is a directory:
-    # Add the directory *containing* 'dashboard' and this script to the path
-    # if SCRIPT_DIR.parent not in sys.path:
-    #    sys.path.insert(0, str(SCRIPT_DIR.parent))
-
     from dashboard.data_utils import generate_summary_from_logs as generate_dashboard_summary_file
-    from dashboard.llm_utils import generate_summary_from_raw_with_llm
     DASHBOARD_UTILS_AVAILABLE = True
-    print("INFO: Dashboard utilities (data_utils, llm_utils) loaded successfully.")
+    print("INFO: Dashboard data utilities loaded successfully.")
 except ImportError as e:
     DASHBOARD_UTILS_AVAILABLE = False
-    print(f"WARNING: Dashboard utilities not found or import error ({e}).")
-    print("INFO: Agent will use fallback mechanisms for summaries and LLM features.")
+    print(f"WARNING: Dashboard data utilities not found or import error ({e}).")
+    print("INFO: Agent will use fallback mechanisms for summaries.")
     print(f"INFO: Python sys.path: {sys.path}")
-    # Define dummy functions if dashboard utils are not available, so agent can still run
-    if 'generate_dashboard_summary_file' not in globals():
-        def generate_dashboard_summary_file(date_str: str) -> Optional[Dict[str, Any]]:
-            print(f"Fallback: generate_dashboard_summary_file called for {date_str} (dashboard_utils not available).")
-            return None 
-    if 'generate_summary_from_raw_with_llm' not in globals():
-        def generate_summary_from_raw_with_llm(titles, ocr, allow_suggestions=True, return_prompt=False) -> Tuple[str, str, str, Optional[str]]:
-            print("Fallback: generate_summary_from_raw_with_llm called (llm_utils not available).")
-            return "LLM utils unavailable", "", "", (None if not return_prompt else "LLM utils unavailable")
 
+# Define dummy function if dashboard utils are not available
+if not DASHBOARD_UTILS_AVAILABLE:
+    def generate_dashboard_summary_file(date_str: str) -> Optional[Dict[str, Any]]:
+        print(f"Fallback: generate_dashboard_summary_file called for {date_str} (dashboard_utils not available).")
+        return None 
 
 # Configure logging
 logging.basicConfig(
@@ -111,6 +91,7 @@ logging.basicConfig(
 logger = logging.getLogger("focus_monitor_agent") # More specific logger name
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 logging.getLogger("streamlit.runtime.state.session_state_proxy").setLevel(logging.ERROR)
+
 # --- Configuration (Agent's own classification rules) ---
 PRODUCTIVE_EXES = {"code.exe", "pycharm.exe", "idea.exe", "webstorm.exe", "goland.exe", "clion.exe", "word.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "chrome.exe", "firefox.exe", "msedge.exe", "cmd.exe", "powershell.exe", "wt.exe", "explorer.exe", "obsidian.exe"}
 DISTRACTION_EXES = {"steam.exe", "epicgameslauncher.exe", "origin.exe", "spotify.exe", "discord.exe", "slack.exe", "netflix.exe", "whatsapp.exe", "telegram.exe"} # Note: Slack can be dual-use
@@ -127,26 +108,8 @@ FIREFOX_PROFILE_PATTERN = re.compile(r"Mozilla Firefox(?:\s*-\s*(.+))?$")
 # --- Set to True during setup/debugging, False in production ---
 COLOR_DETECTION_DEBUG = True
 
-# Configuration for browser profile color detection
-BROWSER_COLOR_PROFILES = [
-    {
-        "name": "Edge - Personal",
-        "exe_pattern": "msedge.exe",
-        "color_rgb": (7, 43, 71),  # 0x0C4C7D in RGB - UPDATE THIS WITH ACTUAL COLOR
-        "color_tolerance": 15,  # Much stricter tolerance
-        "search_rect": (9, 3, 30, 30),  # Adjust this if needed: (x_offset, y_offset, width, height)
-        "category_id": "personal_browsing"
-    },
-    # Example of how to add more profiles with actual colors you find:
-    # {
-    #     "name": "Edge - Work",
-    #     "exe_pattern": "msedge.exe", 
-    #     "color_rgb": (96, 157, 191),  # Example: if light blue theme is work profile
-    #     "color_tolerance": 15,
-    #     "search_rect": (9, 3, 30, 30), 
-    #     "category_id": "work_browsing"
-    # },
-]
+# Browser profiles are now loaded from JSON configuration file managed by the dashboard
+# No hardcoded profiles here anymore
 
 
 class FocusMonitorAgent:
@@ -166,8 +129,8 @@ class FocusMonitorAgent:
         self.session_start_tag: str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.time_buckets: Dict[int, Dict[str, Any]] = {} # bucket_index: bucket_data
         
-        # NEW: Track bucket summarization state
-        self.summarized_buckets: Set[int] = set()  # Track which buckets have been summarized
+        # NEW: Track bucket finalization state (simplified since no LLM processing)
+        self.finalized_buckets: Set[int] = set()  # Track which buckets have been finalized
         self.current_bucket_index: Optional[int] = None  # Track current active bucket
 
         # Create focus_logs directory within the script or specified directory
@@ -179,11 +142,86 @@ class FocusMonitorAgent:
         self.ocr_last_times: Dict[int, float] = {} # hwnd: timestamp of last OCR
         self.ocr_results_cache: Dict[int, Dict[str, str]] = {} # hwnd: {"text": ..., "path": ...}
 
+        # Browser profiles - loaded from configuration file managed by dashboard
+        self.browser_profiles: List[Dict[str, Any]] = []
+        self.last_profiles_load_time: float = 0
+        self.profiles_reload_interval: int = 30  # Reload profiles every 30 seconds
+        self._load_browser_profiles()
+
         logger.info(
             f"Initialized FocusMonitorAgent. Output Dir: {self.focus_logs_dir}, API URL: {self.api_url or 'Disabled'}"
         )
+        logger.info("LLM processing disabled in agent - handled by dashboard for user control")
+        logger.info(f"Loaded {len(self.browser_profiles)} browser profiles for color detection")
         if not OCR_AVAILABLE:
             logger.warning("OCR features disabled as pytesseract/Pillow are not available.")
+
+    def _load_browser_profiles(self):
+        """Load browser profiles from JSON configuration file managed by dashboard."""
+        profiles_file = self.focus_logs_dir / "browser_profiles.json"
+        
+        try:
+            if profiles_file.exists():
+                with open(profiles_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    profiles = data.get("profiles", [])
+                    
+                    # Filter to only enabled profiles and convert lists back to Tuples where needed
+                    self.browser_profiles = []
+                    for profile in profiles:
+                        if profile.get("enabled", True):  # Default to enabled if not specified
+                            # Convert color_rgb and search_rect from lists to Tuples for consistency
+                            processed_profile = profile.copy()
+                            processed_profile["color_rgb"] = Tuple(profile.get("color_rgb", [128, 128, 128]))
+                            processed_profile["search_rect"] = Tuple(profile.get("search_rect", [10, 5, 25, 25]))
+                            self.browser_profiles.append(processed_profile)
+                    
+                    self.last_profiles_load_time = time.time()
+                    logger.debug(f"Loaded {len(self.browser_profiles)} enabled browser profiles from {profiles_file}")
+            else:
+                # Create default profile file if it doesn't exist
+                self._create_default_profiles_file(profiles_file)
+                    
+        except Exception as e:
+            logger.error(f"Error loading browser profiles from {profiles_file}: {e}")
+            # Fall back to empty profiles list
+            self.browser_profiles = []
+
+    def _create_default_profiles_file(self, profiles_file: Path):
+        """Create a default browser profiles file."""
+        default_profiles = {
+            "profiles": [
+                {
+                    "name": "Edge - Personal",
+                    "exe_pattern": "msedge.exe",
+                    "color_rgb": [7, 43, 71],
+                    "color_tolerance": 15,
+                    "search_rect": [9, 3, 30, 30],
+                    "category_id": "personal_browsing",
+                    "enabled": True
+                }
+            ]
+        }
+        
+        try:
+            with open(profiles_file, "w", encoding="utf-8") as f:
+                json.dump(default_profiles, f, indent=2)
+            logger.info(f"Created default browser profiles file: {profiles_file}")
+            # Load the profiles we just created
+            self._load_browser_profiles()
+        except Exception as e:
+            logger.error(f"Failed to create default browser profiles file: {e}")
+            self.browser_profiles = []
+
+    def _reload_browser_profiles_if_needed(self):
+        """Reload browser profiles if enough time has passed since last load."""
+        if time.time() - self.last_profiles_load_time >= self.profiles_reload_interval:
+            old_count = len(self.browser_profiles)
+            self._load_browser_profiles()
+            new_count = len(self.browser_profiles)
+            
+            if new_count != old_count:
+                logger.info(f"Browser profiles reloaded: {old_count} -> {new_count} profiles")
 
     def _get_monitor_info(self) -> List[Dict[str, int]]:
         """Get monitor information using Windows API."""
@@ -392,7 +430,7 @@ class FocusMonitorAgent:
     def _check_color_profiles_for_window(self, hwnd, exe_path, window_title):
         """
         Checks if the window matches any of the color profiles and returns the matching category ID.
-        First verifies that we're dealing with Edge before attempting color detection.
+        First verifies that we're dealing with a supported browser before attempting color detection.
         When a color match is found, the window is automatically categorized.
         
         Args:
@@ -403,14 +441,22 @@ class FocusMonitorAgent:
         Returns:
             str: Category ID from matching profile, or empty string if no match
         """
-        # First, check if this is Edge - only proceed with color detection for Edge
+        # Reload profiles periodically to pick up changes from dashboard
+        self._reload_browser_profiles_if_needed()
+        
+        if not self.browser_profiles:
+            return ""  # No profiles configured
+        
         exe_basename = os.path.basename(exe_path).lower()
         
-        if "msedge.exe" not in exe_basename:
-            return ""  # Skip color detection for non-Edge windows
+        # Find matching profiles for this executable
+        matching_profiles = [
+            p for p in self.browser_profiles 
+            if p.get("exe_pattern", "").lower() == exe_basename
+        ]
         
-        # Only check profiles for Edge
-        matching_profiles = [p for p in BROWSER_COLOR_PROFILES if p["exe_pattern"].lower() in exe_basename]
+        if not matching_profiles:
+            return ""  # No profiles for this browser
         
         for profile in matching_profiles:
             # Check if the color is present in the defined region using the robust method
@@ -421,8 +467,9 @@ class FocusMonitorAgent:
                 profile.get("color_tolerance", 20)
             ):
                 # Color match found - automatically categorize this window
-                category_id = profile["category_id"]
-                logger.info(f"🎯 COLOR MATCH: Window '{window_title[:50]}' automatically categorized as '{category_id}' based on profile '{profile['name']}'")
+                category_id = profile.get("category_id", "")
+                profile_name = profile.get("name", "Unknown Profile")
+                logger.info(f"🎯 COLOR MATCH: Window '{window_title[:50]}' automatically categorized as '{category_id}' based on profile '{profile_name}'")
                 return category_id
         
         return ""  # No match found
@@ -513,17 +560,20 @@ class FocusMonitorAgent:
         if app_name_without_ext == "unknown": # Handle cases where exe path couldn't be determined
             return "Unknown Application", exe_path
 
-        # Check for color profile match for browsers - only for Edge
-        if app_name_without_ext == "msedge" and process_id > 0:
+        # Check for color profile match for browsers - only for supported browsers
+        if process_id > 0 and any(p.get("exe_pattern", "").lower() == app_basename for p in self.browser_profiles):
             try:
                 hwnd = win32gui.GetForegroundWindow()  # Use the current foreground window
                 profile_category_id = self._check_color_profiles_for_window(hwnd, exe_path, window_title)
                 if profile_category_id:
                     # Find the profile name from the category
-                    profile_name = next((p["name"] for p in BROWSER_COLOR_PROFILES 
-                                      if p["category_id"] == profile_category_id), None)
-                    if profile_name:
-                        return f"{app_name_without_ext} - {profile_name}", exe_path
+                    matching_profile = next(
+                        (p for p in self.browser_profiles if p.get("category_id") == profile_category_id), 
+                        None
+                    )
+                    if matching_profile:
+                        detected_profile_name = matching_profile.get("name", "")
+                        return f"{app_name_without_ext} - {detected_profile_name}", exe_path
             except Exception as e:
                 logger.debug(f"Error in color profile detection for app identity: {e}")
 
@@ -642,7 +692,6 @@ class FocusMonitorAgent:
             # Check for color profile match if it's a browser window
             hwnd = window_info.get("hwnd")
             if hwnd:
-                # Note: _check_color_profiles_for_window will internally check if it's Edge
                 profile_category_id = self._check_color_profiles_for_window(
                     hwnd, window_info["exe"], window_info["title"]
                 )
@@ -650,11 +699,14 @@ class FocusMonitorAgent:
                     # Store the detected profile category in the log entry for later use
                     log_entry["detected_profile_category"] = profile_category_id
                     # Also update the app_name to reflect the detected category
-                    profile_name = next((p["name"] for p in BROWSER_COLOR_PROFILES 
-                                      if p["category_id"] == profile_category_id), profile_category_id)
-                    log_entry["app_name"] = f"msedge - {profile_name}"
-                    logger.info(f"🎯 CATEGORIZED: Window automatically categorized and logged as '{log_entry['app_name']}' with category '{profile_category_id}'")
-
+                    matching_profile = next(
+                        (p for p in self.browser_profiles if p.get("category_id") == profile_category_id), 
+                        None
+                    )
+                    if matching_profile:
+                        profile_name = matching_profile.get("name", profile_category_id)
+                        log_entry["app_name"] = f"{os.path.basename(window_info['exe']).replace('.exe', '')} - {profile_name}"
+                        logger.info(f"🎯 CATEGORIZED: Window automatically categorized and logged as '{log_entry['app_name']}' with category '{profile_category_id}'")
 
             # Add OCR info if available from current capture or cache
             hwnd = window_info.get("hwnd")
@@ -686,7 +738,7 @@ class FocusMonitorAgent:
             logger.error(f"Error writing to log file {log_file_path}: {e_log}")
 
     def _update_time_bucket(self, log_entry_data: Dict[str, Any]):
-        """Update the in-memory 5-minute bucket summary with a new log entry."""
+        """Update the in-memory 5-minute bucket with a new log entry (NO LLM processing)."""
         try:
             # Timestamp from log_entry is already UTC ISO format
             log_ts = datetime.datetime.fromisoformat(log_entry_data["timestamp"]).timestamp() # Convert to UNIX timestamp
@@ -698,8 +750,8 @@ class FocusMonitorAgent:
         
         # Check if we've moved to a new bucket
         if self.current_bucket_index is not None and bucket_index != self.current_bucket_index:
-            # We've moved to a new bucket, so summarize the previous one
-            self._finalize_bucket_summary(self.current_bucket_index)
+            # We've moved to a new bucket, so finalize the previous one
+            self._finalize_bucket(self.current_bucket_index)
         
         self.current_bucket_index = bucket_index
         
@@ -714,7 +766,7 @@ class FocusMonitorAgent:
                 "start": datetime.datetime.fromtimestamp(current_bucket_start_ts, tz=datetime.timezone.utc).isoformat(),
                 "end": datetime.datetime.fromtimestamp(current_bucket_end_ts, tz=datetime.timezone.utc).isoformat(),
                 "apps": set(), "titles": set(), "ocr_text": set(), 
-                "summary": "", "category_id": "" # Placeholders for LLM output
+                "summary": "", "category_id": "" # Empty - to be filled by dashboard
             }
         )
 
@@ -728,65 +780,23 @@ class FocusMonitorAgent:
             bucket_data["category_id"] = log_entry_data["detected_profile_category"]
             logger.debug(f"Setting bucket category to '{bucket_data['category_id']}' based on color profile detection")
 
-    def _finalize_bucket_summary(self, bucket_index: int):
-        """Generate LLM summary for a completed bucket (when we move to the next bucket)."""
-        if bucket_index in self.summarized_buckets:
-            return  # Already summarized
+    def _finalize_bucket(self, bucket_index: int):
+        """Mark a bucket as finalized (no LLM processing in agent)."""
+        if bucket_index in self.finalized_buckets:
+            return  # Already finalized
             
         if bucket_index not in self.time_buckets:
             return  # Bucket doesn't exist
             
         bucket_data = self.time_buckets[bucket_index]
         
-        # Generate summary for this completed bucket
-        self._generate_bucket_summary(bucket_data)
+        # Mark as finalized (no LLM processing needed in agent)
+        self.finalized_buckets.add(bucket_index)
         
-        # Mark as summarized
-        self.summarized_buckets.add(bucket_index)
-        
-        logger.info(f"Finalized summary for bucket {bucket_index} ({bucket_data.get('start', '')})")
-
-    def _generate_bucket_summary(self, bucket_dict_to_update: Dict[str, Any]):
-        """
-        Summarize a time bucket using LLM (if available) and store the result in the bucket_dict.
-        This is now only called when a bucket is complete.
-        """
-        if not DASHBOARD_UTILS_AVAILABLE or 'generate_summary_from_raw_with_llm' not in globals():
-            logger.debug("LLM utils for bucket summary not available. Skipping LLM summarization for bucket.")
-            bucket_dict_to_update.setdefault("summary", "LLM utils unavailable for agent summarization.")
-            bucket_dict_to_update.setdefault("category_id", "")
-            return
-
-        try:
-            # Get titles and OCR text from the bucket (which are sets)
-            titles_list = list(bucket_dict_to_update.get("titles", set()))
-            ocr_text_list = list(bucket_dict_to_update.get("ocr_text", set()))
-            
-            if not titles_list and not ocr_text_list: # No content to summarize
-                bucket_dict_to_update["summary"] = "No activity detected"
-                bucket_dict_to_update["category_id"] = ""
-                return
-
-            logger.info(f"Generating LLM summary for bucket {bucket_dict_to_update.get('start', '')} with {len(titles_list)} titles and {len(ocr_text_list)} OCR texts")
-
-            # Use the refactored LLM utility from dashboard.llm_utils
-            # allow_suggestions=False for the agent, as it just records. UI handles suggestions.
-            # The fourth element (prompt_text) is ignored by the agent.
-            summary_text, category_id, _suggested_category, _ = generate_summary_from_raw_with_llm(
-                titles_list, ocr_text_list, allow_suggestions=False, return_prompt=False
-            ) 
-
-            bucket_dict_to_update["summary"] = summary_text if summary_text else ""
-            bucket_dict_to_update["category_id"] = category_id if category_id else ""
-            logger.info(f"Bucket summarized. Summary: '{summary_text[:50]}...', Category: {category_id or 'None'}")
-
-        except Exception as e_llm_bucket:
-            logger.error(f"Error generating bucket summary using llm_utils: {e_llm_bucket}")
-            bucket_dict_to_update.setdefault("summary", f"LLM Error: {str(e_llm_bucket)[:50]}")
-            bucket_dict_to_update.setdefault("category_id", "")
+        logger.info(f"Finalized data collection for bucket {bucket_index} ({bucket_data.get('start', '')}) - LLM processing deferred to dashboard")
 
     def _write_time_bucket_summary(self):
-        """Write the current session's time bucket summaries to a JSON file."""
+        """Write the current session's time bucket data to a JSON file (no LLM summaries)."""
         if not self.time_buckets:
             logger.info("No time buckets to write for current session.")
             return
@@ -803,30 +813,26 @@ class FocusMonitorAgent:
                 "apps": sorted(list(bucket_content.get("apps", set()))), # Convert sets to sorted lists
                 "titles": sorted(list(bucket_content.get("titles", set()))),
                 "ocr_text": sorted(list(bucket_content.get("ocr_text", set()))),
-                "summary": bucket_content.get("summary", ""),
-                "category_id": bucket_content.get("category_id", "")
+                "summary": bucket_content.get("summary", ""), # Will be empty until dashboard processes
+                "category_id": bucket_content.get("category_id", "") # May be set by color detection
             })
 
         try:
             with open(bucket_file_path, "w", encoding="utf-8") as f:
                 json.dump(serializable_buckets_list, f, indent=2)
-            logger.info(f"Wrote {len(serializable_buckets_list)} time bucket summaries to {bucket_file_path}")
+            logger.info(f"Wrote {len(serializable_buckets_list)} time bucket data entries to {bucket_file_path} (summaries to be generated by dashboard)")
         except Exception as e_write_bucket:
-            logger.error(f"Error writing time bucket summary file {bucket_file_path}: {e_write_bucket}")
+            logger.error(f"Error writing time bucket data file {bucket_file_path}: {e_write_bucket}")
 
     def _generate_daily_summary(self, date_to_summarize: Optional[str] = None):
         """
-        Generate a daily summary.
-        If dashboard_utils are available, it uses them to create a base summary (which includes labeling),
-        then this agent enhances it with its own metrics (focus score, etc.) based on raw log data.
-        If dashboard_utils are not available, it creates a more basic summary itself.
-        The final, potentially enhanced, summary is saved to 'daily_summary_{date_str}.json'.
+        Generate a daily summary using dashboard utilities if available.
+        The agent focuses on basic metrics, letting the dashboard handle LLM features.
         """
         target_date_str = date_to_summarize if date_to_summarize else self.today
         logger.info(f"Generating daily summary for {target_date_str}...")
 
         # Attempt to generate (or load if already generated by dashboard) the base summary
-        # generate_dashboard_summary_file (alias for data_utils.generate_summary_from_logs) now handles saving the file.
         base_summary_dict = None
         if DASHBOARD_UTILS_AVAILABLE:
             logger.info(f"Using dashboard.data_utils to generate base summary for {target_date_str}")
@@ -834,9 +840,8 @@ class FocusMonitorAgent:
         
         if not base_summary_dict:
             logger.warning(f"Base summary from dashboard_utils failed or unavailable for {target_date_str}.")
-            logger.info(f"Agent will attempt to create a summary from raw logs for {target_date_str} if they exist.")
+            logger.info(f"Agent will attempt to create a minimal summary from raw logs for {target_date_str} if they exist.")
             # Minimal fallback if dashboard_utils didn't produce anything (e.g. no logs)
-            # This path should ideally not be hit if logs exist, as generate_dashboard_summary_file handles empty logs.
             log_file_for_check = self.focus_logs_dir / f"focus_log_{target_date_str}.jsonl"
             if not log_file_for_check.exists():
                 logger.error(f"No log file found at {log_file_for_check}. Cannot generate any summary for {target_date_str}.")
@@ -851,7 +856,6 @@ class FocusMonitorAgent:
         raw_log_file_path = self.focus_logs_dir / f"focus_log_{target_date_str}.jsonl"
         if not raw_log_file_path.exists():
             logger.warning(f"Raw log file {raw_log_file_path.name} missing. Cannot calculate agent-specific metrics. Using base summary as is.")
-            # The base_summary (potentially from dashboard_utils) is already saved by generate_dashboard_summary_file
             return summary_to_enhance 
 
         agent_perspective_log_entries: List[Dict[str, Any]] = []
@@ -887,9 +891,6 @@ class FocusMonitorAgent:
         agent_classified_distraction_apps = set()
 
         # Aggregate raw exe/titles for agent's classification perspective
-        # Note: This uses the 'app_name' field directly from the raw log, which might include profile info.
-        # This is different from the dashboard's `apply_labels_to_logs` which creates `original_app_name`.
-        # For agent's classification, it makes sense to use what it logged as `app_name`.
         raw_app_aggregates_for_agent: Dict[str, Dict[str, Any]] = {}
         for entry in agent_perspective_log_entries:
             # Use 'app_name' as logged by agent (which might be 'app_identity_name')
@@ -914,7 +915,6 @@ class FocusMonitorAgent:
         summary_to_enhance["distractionApps"] = sorted(list(agent_classified_distraction_apps))
         
         # Use totalTime from the base_summary (which is sum of all durations from logs)
-        # If base_summary somehow missed totalTime, recalculate from agent_perspective_log_entries.
         total_time_for_score_calc = summary_to_enhance.get("totalTime", sum(e["duration"] for e in agent_perspective_log_entries))
         if total_time_for_score_calc == 0 and agent_perspective_log_entries: # Recalculate if base was 0 but we have entries
             total_time_for_score_calc = sum(e["duration"] for e in agent_perspective_log_entries)
@@ -925,7 +925,6 @@ class FocusMonitorAgent:
         )
         
         # Re-save the summary file, now enhanced with agent-specific metrics
-        # This overwrites the file saved by generate_dashboard_summary_file (if it ran)
         final_summary_file_path = self.focus_logs_dir / f"daily_summary_{target_date_str}.json"
         try:
             with open(final_summary_file_path, "w", encoding="utf-8") as f_final_sum:
@@ -933,8 +932,6 @@ class FocusMonitorAgent:
             logger.info(f"Agent-enhanced daily summary for {target_date_str} saved to {final_summary_file_path.name}")
         except Exception as e_save_final:
             logger.error(f"Error re-saving agent-enhanced daily summary {final_summary_file_path.name}: {e_save_final}")
-            # If save fails, the version from generate_dashboard_summary_file might still exist.
-            # Return what we have in memory.
             return summary_to_enhance 
 
         # Optionally, generate a simple chart from the agent's perspective
@@ -969,7 +966,6 @@ class FocusMonitorAgent:
         titles_concatenated_lower = " ".join(str(t).lower() for t in window_titles if t).strip()
         
         # Check if exe_basename_lower matches any in PRODUCTIVE_EXES
-        # PRODUCTIVE_EXES contains basenames, some with .exe, some without.
         is_prod_exe = False
         for prod_exe_pattern in PRODUCTIVE_EXES:
             if prod_exe_pattern.endswith(".exe"):
@@ -1106,7 +1102,7 @@ class FocusMonitorAgent:
                     if time.time() - self.last_summary_time >= self.summary_interval:
                         # Before generating daily summary, finalize any active bucket
                         if self.current_bucket_index is not None:
-                            self._finalize_bucket_summary(self.current_bucket_index)
+                            self._finalize_bucket(self.current_bucket_index)
                         
                         self._generate_daily_summary() # Will use self.today
                         self._write_time_bucket_summary() # Write current session buckets
@@ -1125,7 +1121,7 @@ class FocusMonitorAgent:
                     )
                     # Finalize any active bucket before day change
                     if self.current_bucket_index is not None:
-                        self._finalize_bucket_summary(self.current_bucket_index)
+                        self._finalize_bucket(self.current_bucket_index)
                     
                     self._generate_daily_summary(self.today) # Final summary for the day that just ended
                     self._write_time_bucket_summary() # Write out buckets for the session that just ended with the day
@@ -1135,7 +1131,7 @@ class FocusMonitorAgent:
                     self.session_start_time = time.time() # New session starts now
                     self.session_start_tag = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     self.time_buckets = {} # Clear buckets for the new session
-                    self.summarized_buckets = set() # Clear summarized buckets tracking
+                    self.finalized_buckets = set() # Clear finalized buckets tracking
                     self.current_bucket_index = None # Reset current bucket tracking
                     self.last_window_info = None # Treat as fresh start for window tracking
                     self.window_start_time = time.time()
@@ -1173,7 +1169,7 @@ class FocusMonitorAgent:
                 if time.time() - self.last_summary_time >= self.summary_interval:
                     # Before generating daily summary, finalize any active bucket
                     if self.current_bucket_index is not None:
-                        self._finalize_bucket_summary(self.current_bucket_index)
+                        self._finalize_bucket(self.current_bucket_index)
                     
                     self._generate_daily_summary() # Uses self.today
                     self._write_time_bucket_summary() # Writes current session's buckets
@@ -1196,7 +1192,7 @@ class FocusMonitorAgent:
         
         # Finalize any remaining active bucket before final cleanup
         if self.current_bucket_index is not None:
-            self._finalize_bucket_summary(self.current_bucket_index)
+            self._finalize_bucket(self.current_bucket_index)
             
         if self.last_window_info:  # Log any final pending activity
             duration_final = int(time.time() - self.window_start_time)

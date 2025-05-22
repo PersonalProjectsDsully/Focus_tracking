@@ -15,7 +15,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st # Keep for type hinting and potential direct use if careful
@@ -650,13 +650,127 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
             print(msg)
         return False
 
-# Note: The st.session_state['streamlit_running'] flag should be initialized
-# at the very beginning of the main Streamlit application script (e.g., focus_monitor_dashboard.py)
-# like this:
-#
-# import streamlit as st
-# if 'streamlit_running' not in st.session_state:
-# st.session_state['streamlit_running'] = True
-#
-# This ensures that when this data_utils module is imported by the Streamlit app,
-# the session state is already set, and _is_streamlit_running() will correctly identify the context.
+BROWSER_PROFILES_FILE = LOGS_DIR / "browser_profiles.json"
+
+def load_browser_profiles() -> List[Dict[str, Any]]:
+    """Load browser profiles from the profiles file."""
+    if not BROWSER_PROFILES_FILE.exists():
+        # Return default profile if file doesn't exist
+        return [
+            {
+                "name": "Edge - Personal",
+                "exe_pattern": "msedge.exe",
+                "color_rgb": [7, 43, 71],  # Store as list for JSON compatibility
+                "color_tolerance": 15,
+                "search_rect": [9, 3, 30, 30],  # [x_offset, y_offset, width, height]
+                "category_id": "personal_browsing",
+                "enabled": True
+            }
+        ]
+    try:
+        with open(BROWSER_PROFILES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("profiles", [])
+    except Exception as e:
+        if _is_streamlit_running():
+            st.error(f"Error loading browser profiles: {e}")
+        else:
+            print(f"Error loading browser profiles: {e}")
+        return []
+
+def save_browser_profiles(profiles: List[Dict[str, Any]]) -> bool:
+    """Save browser profiles to the profiles file."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(BROWSER_PROFILES_FILE, "w", encoding="utf-8") as f:
+            json.dump({"profiles": profiles}, f, indent=2)
+        return True
+    except Exception as e:
+        if _is_streamlit_running():
+            st.error(f"Error saving browser profiles: {e}")
+        else:
+            print(f"Error saving browser profiles: {e}")
+        return False
+
+def get_available_exe_patterns() -> List[str]:
+    """Get list of common browser executable patterns."""
+    return [
+        "msedge.exe",
+        "chrome.exe", 
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "vivaldi.exe",
+        "safari.exe"
+    ]
+
+def validate_browser_profile(profile: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Validate a browser profile configuration.
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    required_fields = ["name", "exe_pattern", "color_rgb", "search_rect", "category_id"]
+    
+    for field in required_fields:
+        if field not in profile:
+            return False, f"Missing required field: {field}"
+    
+    # Validate color_rgb format
+    color_rgb = profile["color_rgb"]
+    if not isinstance(color_rgb, (list, tuple)) or len(color_rgb) != 3:
+        return False, "color_rgb must be a list/tuple of 3 values [R, G, B]"
+    
+    for color_val in color_rgb:
+        if not isinstance(color_val, int) or not (0 <= color_val <= 255):
+            return False, "Each RGB value must be an integer between 0 and 255"
+    
+    # Validate search_rect format
+    search_rect = profile["search_rect"]
+    if not isinstance(search_rect, (list, tuple)) or len(search_rect) != 4:
+        return False, "search_rect must be a list/tuple of 4 values [x, y, width, height]"
+    
+    for rect_val in search_rect:
+        if not isinstance(rect_val, int) or rect_val < 0:
+            return False, "Each search_rect value must be a non-negative integer"
+    
+    # Validate tolerance if present
+    if "color_tolerance" in profile:
+        tolerance = profile["color_tolerance"]
+        if not isinstance(tolerance, int) or not (0 <= tolerance <= 255):
+            return False, "color_tolerance must be an integer between 0 and 255"
+    
+    # Validate exe_pattern
+    if not isinstance(profile["exe_pattern"], str) or not profile["exe_pattern"].strip():
+        return False, "exe_pattern must be a non-empty string"
+    
+    # Validate name
+    if not isinstance(profile["name"], str) or not profile["name"].strip():
+        return False, "name must be a non-empty string"
+    
+    return True, ""
+
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color string to RGB tuple."""
+    # Remove # if present
+    hex_color = hex_color.lstrip('#')
+    # Convert to RGB
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    """Convert RGB tuple to hex color string."""
+    return "#{:02x}{:02x}{:02x}".format(rgb[0], rgb[1], rgb[2])
+
+def get_default_search_rect_for_browser(exe_pattern: str) -> List[int]:
+    """Get default search rectangle based on browser type."""
+    # These are starting points - users should adjust based on their setup
+    defaults = {
+        "msedge.exe": [9, 3, 30, 30],      # Edge profile indicator location
+        "chrome.exe": [40, 8, 25, 25],     # Chrome profile avatar location  
+        "firefox.exe": [45, 10, 20, 20],   # Firefox profile area
+        "brave.exe": [40, 8, 25, 25],      # Similar to Chrome
+        "opera.exe": [35, 8, 25, 25],      # Opera profile area
+        "vivaldi.exe": [40, 8, 25, 25],    # Similar to Chrome
+    }
+    return defaults.get(exe_pattern, [10, 5, 25, 25])  # Generic default

@@ -14,7 +14,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import psutil
-
+from dashboard.data_utils import (
+     load_browser_profiles, save_browser_profiles, get_available_exe_patterns,
+     validate_browser_profile, hex_to_rgb, rgb_to_hex, get_default_search_rect_for_browser
+)
 
 # Import all utility functions from dashboard modules
 from dashboard.data_utils import (
@@ -23,6 +26,9 @@ from dashboard.data_utils import (
     load_block_feedback, save_block_feedback, load_time_buckets_for_date,
     update_bucket_summary_in_file, load_categories, save_categories,
     update_bucket_category_in_file, generate_time_buckets_from_logs,
+    # Add these new imports:
+    load_browser_profiles, save_browser_profiles, get_available_exe_patterns,
+    validate_browser_profile, hex_to_rgb, rgb_to_hex, get_default_search_rect_for_browser,
     LOGS_DIR, LABELS_FILE, FEEDBACK_FILE, CATEGORIES_FILE
 )
 from dashboard.llm_utils import (
@@ -95,6 +101,382 @@ def stop_tracker():
     finally:
         st.session_state["tracker_pid"] = None
 
+def display_browser_profile_manager():
+    st.title("🌐 Browser Profile Manager")
+    st.markdown("""
+    Configure browser profiles for automatic categorization based on visual color detection.
+    The focus monitor will detect these colors in browser windows and automatically categorize activities.
+    """)
+    
+    # Load existing profiles and categories
+    profiles = load_browser_profiles()
+    categories = load_categories()
+    
+    if not categories:
+        st.error("No activity categories defined. Please create categories first in the 'Activity Categories Manager' tab.")
+        st.stop()
+    
+    # Display existing profiles
+    if profiles:
+        st.subheader("Current Browser Profiles")
+        
+        # Create a more visual display of profiles
+        for i, profile in enumerate(profiles):
+            enabled_icon = "✅" if profile.get("enabled", True) else "❌"
+            color_rgb = tuple(profile.get("color_rgb", [128, 128, 128]))
+            color_hex = rgb_to_hex(color_rgb)
+            
+            with st.expander(f"{enabled_icon} {profile.get('name', 'Unnamed Profile')} - {profile.get('exe_pattern', 'Unknown')}"):
+                col1, col2, col3 = st.columns([2, 1, 1])
+                
+                with col1:
+                    st.write(f"**Browser:** {profile.get('exe_pattern', 'N/A')}")
+                    st.write(f"**Category:** {profile.get('category_id', 'N/A')}")
+                    st.write(f"**Color:** RGB{color_rgb} ({color_hex})")
+                    st.write(f"**Search Area:** {profile.get('search_rect', 'N/A')} (x, y, width, height)")
+                    st.write(f"**Tolerance:** {profile.get('color_tolerance', 15)}")
+                
+                with col2:
+                    # Show color swatch
+                    st.markdown(
+                        f'<div style="width: 60px; height: 60px; background-color: {color_hex}; '
+                        f'border: 2px solid #ccc; border-radius: 8px; margin: 10px 0;"></div>',
+                        unsafe_allow_html=True
+                    )
+                
+                with col3:
+                    st.write(f"**Status:** {'Enabled' if profile.get('enabled', True) else 'Disabled'}")
+    else:
+        st.info("No browser profiles defined yet. Use the form below to create profiles.")
+    
+    # Add new profile form
+    st.subheader("Add New Browser Profile")
+    
+    with st.form("add_browser_profile_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            profile_name = st.text_input(
+                "Profile Name", 
+                placeholder="e.g., Edge - Work, Chrome - Personal"
+            )
+            
+            exe_pattern = st.selectbox(
+                "Browser Executable",
+                options=get_available_exe_patterns(),
+                help="Select the browser executable pattern to match"
+            )
+            
+            # Category selection
+            category_options = [cat.get("id", "") for cat in categories]
+            category_names = [cat.get("name", "Unknown") for cat in categories]
+            category_display = [f"{name} ({id})" for name, id in zip(category_names, category_options)]
+            
+            selected_category_idx = st.selectbox(
+                "Activity Category",
+                options=range(len(category_display)),
+                format_func=lambda x: category_display[x],
+                help="Category to assign when this profile is detected"
+            )
+            selected_category_id = category_options[selected_category_idx]
+        
+        with col2:
+            # Color selection - offer both hex and RGB input
+            color_input_method = st.radio(
+                "Color Input Method",
+                ["Color Picker", "RGB Values", "Hex Code"],
+                horizontal=True
+            )
+            
+            if color_input_method == "Color Picker":
+                # Streamlit color picker returns hex
+                color_hex = st.color_picker("Profile Color", "#072B47")
+                color_rgb = hex_to_rgb(color_hex)
+                st.write(f"RGB: {color_rgb}")
+                
+            elif color_input_method == "RGB Values":
+                rgb_col1, rgb_col2, rgb_col3 = st.columns(3)
+                with rgb_col1:
+                    r_val = st.number_input("Red", min_value=0, max_value=255, value=7)
+                with rgb_col2:
+                    g_val = st.number_input("Green", min_value=0, max_value=255, value=43)
+                with rgb_col3:
+                    b_val = st.number_input("Blue", min_value=0, max_value=255, value=71)
+                color_rgb = (r_val, g_val, b_val)
+                color_hex = rgb_to_hex(color_rgb)
+                st.write(f"Hex: {color_hex}")
+                
+            else:  # Hex Code
+                hex_input = st.text_input("Hex Color Code", value="#072B47", placeholder="#RRGGBB")
+                try:
+                    color_rgb = hex_to_rgb(hex_input)
+                    color_hex = hex_input
+                    st.write(f"RGB: {color_rgb}")
+                except ValueError:
+                    st.error("Invalid hex color code")
+                    color_rgb = (7, 43, 71)
+                    color_hex = "#072B47"
+            
+            # Show color preview
+            st.markdown(
+                f'<div style="width: 80px; height: 80px; background-color: {color_hex}; '
+                f'border: 2px solid #ccc; border-radius: 8px; margin: 10px 0;"></div>',
+                unsafe_allow_html=True
+            )
+        
+        # Advanced settings
+        st.subheader("Detection Settings")
+        adv_col1, adv_col2 = st.columns(2)
+        
+        with adv_col1:
+            # Search rectangle
+            st.write("**Search Rectangle (pixels from top-left of window)**")
+            default_rect = get_default_search_rect_for_browser(exe_pattern)
+            
+            rect_col1, rect_col2, rect_col3, rect_col4 = st.columns(4)
+            with rect_col1:
+                x_offset = st.number_input("X Offset", min_value=0, value=default_rect[0])
+            with rect_col2:
+                y_offset = st.number_input("Y Offset", min_value=0, value=default_rect[1])
+            with rect_col3:
+                width = st.number_input("Width", min_value=1, value=default_rect[2])
+            with rect_col4:
+                height = st.number_input("Height", min_value=1, value=default_rect[3])
+            
+            search_rect = [x_offset, y_offset, width, height]
+        
+        with adv_col2:
+            color_tolerance = st.slider(
+                "Color Tolerance",
+                min_value=0, max_value=50, value=15,
+                help="How much the detected color can vary from the target color (0 = exact match)"
+            )
+            
+            enabled = st.checkbox("Enable Profile", value=True)
+        
+        # Form submission
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            submitted = st.form_submit_button("Add Profile", type="primary")
+        with col2:
+            if st.form_submit_button("🎯 Test Color Detection", help="This will be implemented to help test color detection"):
+                st.info("Color detection testing feature coming soon!")
+        
+        if submitted:
+            if not profile_name or not exe_pattern:
+                st.error("Profile name and browser executable are required")
+            else:
+                # Check for duplicate names
+                if any(p.get("name") == profile_name for p in profiles):
+                    st.error(f"Profile name '{profile_name}' already exists")
+                else:
+                    new_profile = {
+                        "name": profile_name,
+                        "exe_pattern": exe_pattern,
+                        "color_rgb": list(color_rgb),  # Convert tuple to list for JSON
+                        "color_tolerance": color_tolerance,
+                        "search_rect": search_rect,
+                        "category_id": selected_category_id,
+                        "enabled": enabled
+                    }
+                    
+                    # Validate the profile
+                    is_valid, error_msg = validate_browser_profile(new_profile)
+                    if not is_valid:
+                        st.error(f"Profile validation failed: {error_msg}")
+                    else:
+                        profiles.append(new_profile)
+                        if save_browser_profiles(profiles):
+                            st.success(f"Browser profile '{profile_name}' added successfully!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("Failed to save browser profile")
+
+    # Edit/Delete existing profiles
+    if profiles:
+        st.subheader("Edit or Delete Profiles")
+        
+        # Select profile to edit
+        profile_names = [p.get("name", f"Unnamed ({i})") for i, p in enumerate(profiles)]
+        selected_profile_name = st.selectbox(
+            "Select Profile to Edit/Delete",
+            options=profile_names,
+            key="edit_delete_profile_select"
+        )
+        
+        selected_profile_idx = profile_names.index(selected_profile_name)
+        selected_profile = profiles[selected_profile_idx]
+        
+        # Edit form
+        with st.form("edit_browser_profile_form"):
+            edit_col1, edit_col2 = st.columns(2)
+            
+            with edit_col1:
+                edit_name = st.text_input("Profile Name", value=selected_profile.get("name", ""))
+                edit_exe = st.selectbox(
+                    "Browser Executable",
+                    options=get_available_exe_patterns(),
+                    index=get_available_exe_patterns().index(selected_profile.get("exe_pattern", "msedge.exe"))
+                    if selected_profile.get("exe_pattern") in get_available_exe_patterns() else 0
+                )
+                
+                # Category selection for editing
+                current_category_id = selected_profile.get("category_id", "")
+                try:
+                    current_category_idx = category_options.index(current_category_id)
+                except ValueError:
+                    current_category_idx = 0
+                
+                edit_category_idx = st.selectbox(
+                    "Activity Category",
+                    options=range(len(category_display)),
+                    format_func=lambda x: category_display[x],
+                    index=current_category_idx
+                )
+                edit_category_id = category_options[edit_category_idx]
+            
+            with edit_col2:
+                # Color editing
+                current_color_rgb = tuple(selected_profile.get("color_rgb", [7, 43, 71]))
+                current_color_hex = rgb_to_hex(current_color_rgb)
+                
+                edit_color_hex = st.color_picker("Profile Color", current_color_hex)
+                edit_color_rgb = hex_to_rgb(edit_color_hex)
+                
+                # Show color preview
+                st.markdown(
+                    f'<div style="width: 60px; height: 60px; background-color: {edit_color_hex}; '
+                    f'border: 2px solid #ccc; border-radius: 8px; margin: 10px 0;"></div>',
+                    unsafe_allow_html=True
+                )
+            
+            # Advanced settings for editing
+            current_rect = selected_profile.get("search_rect", [9, 3, 30, 30])
+            current_tolerance = selected_profile.get("color_tolerance", 15)
+            current_enabled = selected_profile.get("enabled", True)
+            
+            st.write("**Detection Settings**")
+            edit_adv_col1, edit_adv_col2 = st.columns(2)
+            
+            with edit_adv_col1:
+                st.write("Search Rectangle:")
+                edit_rect_cols = st.columns(4)
+                with edit_rect_cols[0]:
+                    edit_x = st.number_input("X", min_value=0, value=current_rect[0], key="edit_x")
+                with edit_rect_cols[1]:
+                    edit_y = st.number_input("Y", min_value=0, value=current_rect[1], key="edit_y")
+                with edit_rect_cols[2]:
+                    edit_w = st.number_input("W", min_value=1, value=current_rect[2], key="edit_w")
+                with edit_rect_cols[3]:
+                    edit_h = st.number_input("H", min_value=1, value=current_rect[3], key="edit_h")
+                edit_search_rect = [edit_x, edit_y, edit_w, edit_h]
+            
+            with edit_adv_col2:
+                edit_tolerance = st.slider(
+                    "Color Tolerance",
+                    min_value=0, max_value=50, value=current_tolerance,
+                    key="edit_tolerance"
+                )
+                edit_enabled = st.checkbox("Enable Profile", value=current_enabled, key="edit_enabled")
+            
+            # Form buttons
+            btn_col1, btn_col2, btn_col3 = st.columns(3)
+            with btn_col1:
+                update_btn = st.form_submit_button("Update Profile")
+            with btn_col2:
+                delete_btn = st.form_submit_button("Delete Profile", type="secondary")
+            with btn_col3:
+                toggle_btn = st.form_submit_button(
+                    "Disable" if current_enabled else "Enable",
+                    help="Quick toggle to enable/disable profile"
+                )
+            
+            if update_btn:
+                if not edit_name or not edit_exe:
+                    st.error("Profile name and browser executable are required")
+                else:
+                    # Check for duplicate names (excluding current profile)
+                    if edit_name != selected_profile.get("name") and any(p.get("name") == edit_name for p in profiles):
+                        st.error(f"Profile name '{edit_name}' already exists")
+                    else:
+                        updated_profile = {
+                            "name": edit_name,
+                            "exe_pattern": edit_exe,
+                            "color_rgb": list(edit_color_rgb),
+                            "color_tolerance": edit_tolerance,
+                            "search_rect": edit_search_rect,
+                            "category_id": edit_category_id,
+                            "enabled": edit_enabled
+                        }
+                        
+                        # Validate the updated profile
+                        is_valid, error_msg = validate_browser_profile(updated_profile)
+                        if not is_valid:
+                            st.error(f"Profile validation failed: {error_msg}")
+                        else:
+                            profiles[selected_profile_idx] = updated_profile
+                            if save_browser_profiles(profiles):
+                                st.success(f"Profile '{edit_name}' updated successfully!")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error("Failed to save updated profile")
+            
+            if delete_btn:
+                profiles.pop(selected_profile_idx)
+                if save_browser_profiles(profiles):
+                    st.success(f"Profile '{selected_profile_name}' deleted successfully!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Failed to delete profile")
+            
+            if toggle_btn:
+                profiles[selected_profile_idx]["enabled"] = not current_enabled
+                if save_browser_profiles(profiles):
+                    status = "enabled" if not current_enabled else "disabled"
+                    st.success(f"Profile '{selected_profile_name}' {status}!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Failed to update profile status")
+    
+    # Help section
+    st.subheader("ℹ️ How to Use Browser Profiles")
+    with st.expander("Setup Instructions"):
+        st.markdown("""
+        **Setting up browser profiles for automatic detection:**
+        
+        1. **Identify the target color**: Open your browser with the specific profile you want to detect
+        2. **Find the profile indicator**: Look for colored elements that are unique to this profile (e.g., profile avatar, theme colors)
+        3. **Determine coordinates**: The search rectangle defines where to look for the color (x, y from top-left, width, height)
+        4. **Get the exact color**: Use a color picker tool to get the RGB values of the profile indicator
+        5. **Set tolerance**: Higher tolerance allows for slight color variations (recommended: 10-20)
+        6. **Test the setup**: The focus monitor will automatically detect and categorize activities
+        
+        **Tips:**
+        - Profile avatars and theme colors work best for detection
+        - Avoid areas that change frequently (like webpage content)
+        - Start with higher tolerance and adjust down if getting false positives
+        - Different browsers have profile indicators in different locations
+        """)
+    
+    with st.expander("Troubleshooting"):
+        st.markdown("""
+        **Common issues and solutions:**
+        
+        - **Profile not detected**: Check if the search rectangle covers the profile indicator area
+        - **Wrong categorization**: Verify the RGB color values match exactly
+        - **False positives**: Reduce color tolerance or adjust search area
+        - **Multi-monitor issues**: Color detection works across multiple monitors
+        - **Browser updates**: Profile indicator locations may change with browser updates
+        
+        **Getting RGB values:**
+        - Windows: Use built-in Snipping Tool with color picker
+        - Online tools: Use web-based color picker tools
+        - Browser extensions: Color picker browser extensions
+        """)
 
 def display_retroactive_processor():
     st.title("⏮️ Historical Data Processor")
@@ -114,8 +496,19 @@ def display_retroactive_processor():
     col1.metric("Focus Log File", "✅ Found" if log_file.exists() else "❌ Missing")
     col1.metric("Daily Summary File", "✅ Found" if summary_file.exists() else "❌ Missing")
     col2.metric("Time Buckets for Date", f"{len(existing_buckets_for_date)} found" if existing_buckets_for_date else "❌ None Found")
+    
+    # Check how many buckets have LLM summaries
+    if existing_buckets_for_date:
+        buckets_with_summaries = sum(1 for bucket in existing_buckets_for_date if bucket.get("summary", "").strip())
+        buckets_without_summaries = len(existing_buckets_for_date) - buckets_with_summaries
+        col2.metric("Buckets with LLM Summaries", f"{buckets_with_summaries}/{len(existing_buckets_for_date)}")
+        if buckets_without_summaries > 0:
+            st.warning(f"⚠️ {buckets_without_summaries} time buckets are missing LLM summaries (collected by agent but not yet processed)")
 
     st.subheader("Processing Actions")
+    
+    # Daily Summary Processing
+    st.markdown("#### Daily Summary Processing")
     if st.button("🔄 (Re)Generate Daily Summary from Logs", key="proc_gen_summary_btn", help="Parses raw logs, applies labels, and creates/overwrites the daily summary file."):
         with st.spinner("Generating daily summary..."):
             summary_data = generate_summary_from_logs(selected_date) # This now saves the file
@@ -123,13 +516,89 @@ def display_retroactive_processor():
             else: st.error("Failed to process daily summary.")
             st.rerun()
 
-    if st.button("🔄 (Re)Generate 5-Min Time Buckets & LLM Summaries", key="proc_gen_buckets_btn", help="Divides logs into 5-min chunks, calls LLM for summaries/categories, and saves a new time_buckets_*.json file."):
+    # Time Bucket Processing
+    st.markdown("#### Time Bucket Processing")
+    
+    # Option 1: Generate new time buckets from logs (overwrites existing)
+    if st.button("🔄 (Re)Generate 5-Min Time Buckets & LLM Summaries", key="proc_gen_buckets_btn", help="Divides logs into 5-min chunks, calls LLM for summaries/categories, and saves a new time_buckets_*.json file. This will overwrite existing buckets."):
         with st.spinner("Generating time buckets and LLM summaries... This can take time."):
             success = generate_time_buckets_from_logs(selected_date) # This now saves the file
             if success: st.success(f"Time buckets for {selected_date} processed.")
             else: st.error("Failed to process time buckets.")
             st.rerun() # Rerun to refresh bucket count and sample display
-            
+    
+    # Option 2: Process LLM summaries for existing buckets that don't have them
+    if existing_buckets_for_date and buckets_without_summaries > 0:
+        st.markdown("#### LLM Processing for Existing Buckets")
+        st.info(f"Found {buckets_without_summaries} time buckets without LLM summaries. You can generate summaries for these existing buckets without recreating them.")
+        
+        if st.button("🤖 Generate LLM Summaries for Existing Buckets", key="proc_gen_llm_summaries_btn", help="Processes existing time buckets to add LLM-generated summaries and categories where missing."):
+            with st.spinner(f"Generating LLM summaries for {buckets_without_summaries} buckets... This may take some time."):
+                success_count = 0
+                error_count = 0
+                
+                # Group buckets by session tag for efficient file updates
+                buckets_by_session = {}
+                for bucket in existing_buckets_for_date:
+                    if not bucket.get("summary", "").strip():  # Only process buckets without summaries
+                        session_tag = bucket.get("session_tag", "unknown_session")
+                        if session_tag not in buckets_by_session:
+                            buckets_by_session[session_tag] = []
+                        buckets_by_session[session_tag].append(bucket)
+                
+                progress_bar = st.progress(0)
+                total_buckets = sum(len(buckets) for buckets in buckets_by_session.values())
+                processed_buckets = 0
+                
+                for session_tag, session_buckets in buckets_by_session.items():
+                    for bucket in session_buckets:
+                        try:
+                            # Extract data for LLM processing
+                            titles_list = bucket.get("titles", [])
+                            ocr_text_list = bucket.get("ocr_text", [])
+                            
+                            if titles_list or ocr_text_list:
+                                # Generate summary using user's selected LLM provider/model
+                                summary_text, category_id, _suggested_category, _ = generate_summary_from_raw_with_llm(
+                                    titles_list, ocr_text_list, allow_suggestions=False, return_prompt=False
+                                )
+                                
+                                # Update the bucket in the file
+                                bucket_start_iso = bucket.get("start", "")
+                                if summary_text and bucket_start_iso:
+                                    if update_bucket_summary_in_file(session_tag, bucket_start_iso, summary_text):
+                                        success_count += 1
+                                        # Also update category if one was identified
+                                        if category_id:
+                                            update_bucket_category_in_file(session_tag, bucket_start_iso, category_id)
+                                    else:
+                                        error_count += 1
+                                        st.error(f"Failed to update summary for bucket {bucket_start_iso}")
+                                else:
+                                    error_count += 1
+                                    st.warning(f"LLM returned empty summary for bucket {bucket_start_iso}")
+                            else:
+                                # No content to summarize
+                                error_count += 1
+                                
+                        except Exception as e:
+                            error_count += 1
+                            st.error(f"Error processing bucket: {e}")
+                        
+                        processed_buckets += 1
+                        progress_bar.progress(processed_buckets / total_buckets)
+                
+                progress_bar.empty()
+                
+                if success_count > 0:
+                    st.success(f"✅ Successfully generated {success_count} LLM summaries")
+                if error_count > 0:
+                    st.warning(f"⚠️ {error_count} buckets had errors or no content to process")
+                
+                if success_count > 0:
+                    st.rerun()  # Refresh to show updated bucket counts
+    
+    # Display sample of existing buckets
     if existing_buckets_for_date:
         st.subheader("Sample of Existing Time Buckets (Max 5 Shown)")
         categories_map = {cat.get("id"): cat.get("name", "Unknown") for cat in load_categories()}
@@ -137,9 +606,36 @@ def display_retroactive_processor():
             start_dt = pd.to_datetime(bucket.get("start")).strftime("%H:%M")
             end_dt = pd.to_datetime(bucket.get("end")).strftime("%H:%M")
             cat_name = categories_map.get(bucket.get("category_id", ""), "Uncategorized")
-            with st.expander(f"Bucket {start_dt}-{end_dt} [{cat_name}] (Session: {bucket.get('session_tag', 'N/A')})"):
-                st.write("**LLM Summary:**", bucket.get("summary", "_N/A_"))
+            
+            # Show if bucket has LLM summary or not
+            has_summary = bool(bucket.get("summary", "").strip())
+            summary_indicator = "🤖" if has_summary else "⚪"
+            
+            with st.expander(f"{summary_indicator} Bucket {start_dt}-{end_dt} [{cat_name}] (Session: {bucket.get('session_tag', 'N/A')})"):
+                if has_summary:
+                    st.write("**LLM Summary:**", bucket.get("summary", "_N/A_"))
+                else:
+                    st.write("**LLM Summary:** _No summary generated yet_")
+                    st.caption("Raw data available - use 'Generate LLM Summaries' button above to process")
+                
                 st.caption(f"Titles: {len(bucket.get('titles',[]))}, OCR: {len(bucket.get('ocr_text',[]))}")
+                
+                # Show raw data in expandable section
+                if bucket.get('titles') or bucket.get('ocr_text'):
+                    with st.expander("View Raw Data"):
+                        if bucket.get('titles'):
+                            st.write("**Window Titles:**")
+                            for title in bucket.get('titles', [])[:10]:  # Show first 10
+                                st.text(f"• {title}")
+                            if len(bucket.get('titles', [])) > 10:
+                                st.caption(f"... and {len(bucket.get('titles', [])) - 10} more")
+                        
+                        if bucket.get('ocr_text'):
+                            st.write("**OCR Text:**")
+                            for ocr in bucket.get('ocr_text', [])[:5]:  # Show first 5
+                                st.text(f"• {ocr[:100]}{'...' if len(ocr) > 100 else ''}")
+                            if len(bucket.get('ocr_text', [])) > 5:
+                                st.caption(f"... and {len(bucket.get('ocr_text', [])) - 5} more")
 
 
 def llm_test_page():
@@ -1281,16 +1777,24 @@ def display_control_panel():
 def main():
     st.set_page_config(page_title="Focus Monitor", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
     display_control_panel()
-    tab_names = ["📊 Dashboard", "🏷 Activity Label Editor", "📝 5-Min Summaries", "🏆 Categories", "⏮️ Historical Processor", "🧪 LLM Test"]
+    tab_names = [
+        "📊 Dashboard", 
+        "🏷 Activity Label Editor", 
+        "📝 5-Min Summaries", 
+        "🏆 Categories", 
+        "🌐 Browser Profiles",  # New tab
+        "⏮️ Historical Processor", 
+        "🧪 LLM Test"
+    ]
     tabs = st.tabs(tab_names)
     
     with tabs[0]: display_dashboard()
     with tabs[1]: display_label_editor()
     with tabs[2]: display_time_bucket_summaries()
     with tabs[3]: display_category_manager()
-    with tabs[4]: display_retroactive_processor()
-    with tabs[5]: llm_test_page()
-
+    with tabs[4]: display_browser_profile_manager()  # New tab content
+    with tabs[5]: display_retroactive_processor()
+    with tabs[6]: llm_test_page()
 
 if __name__ == "__main__":
     main()

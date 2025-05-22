@@ -5,3 +5,4 @@ focus_logs/block_feedback.json
 color_test_output/*
 dashboard/__pycache__/*
 repomix-output.txt
+.repomix/bundles.json
