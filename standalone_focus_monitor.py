@@ -21,24 +21,83 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+import warnings
+import numpy as np  # Add this import for array operations with image data
 
-import pytesseract
-from PIL import ImageGrab
-
+# Filter out specific Streamlit warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="streamlit")
+warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
+warnings.filterwarnings("ignore", message=".*Session state does not function.*")
+# Attempt to import Tesseract and Pillow for OCR; fail gracefully if not present.
 try:
-    import requests  # Optional for API features
+    import pytesseract
+    from PIL import ImageGrab, Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    print("Warning: pytesseract or Pillow not found. OCR features will be disabled.")
+    print("Install with: pip install pytesseract Pillow")
+
+# Attempt to import core Windows API, requests; these are critical.
+try:
+    import requests 
     import win32api
-    import win32con  # For constants if needed later
+    import win32con 
     import win32gui
     import win32process
-    import wmi  # For Chrome profile detection
+    # WMI is optional for advanced Chrome profile detection, can be removed if not used/working.
+    # import wmi 
 except ImportError:
-    print("Required packages not found. Please install with:")
-    print("pip install pywin32 requests wmi")
+    print("Critical packages (pywin32, requests) not found. Please install them.")
+    print("pip install pywin32 requests")
     sys.exit(1)
 
-# Get the directory where this script is located
+# Get the directory where this script is located and add parent to path for dashboard imports
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+# Assuming project structure: project_root/dashboard/ and project_root/standalone_focus_monitor.py
+# or project_root/src/dashboard/ and project_root/src/standalone_focus_monitor.py
+# If dashboard is a sibling directory:
+# sys.path.append(str(SCRIPT_DIR.parent))
+# If dashboard is a child of a common 'src' or 'app' directory:
+# sys.path.append(str(SCRIPT_DIR.parent.parent)) # Adjust based on actual structure
+
+# --- Conditional import for dashboard utilities ---
+# This setup assumes 'dashboard' is a package discoverable by Python.
+# If 'standalone_focus_monitor.py' is inside a project with a 'dashboard' sibling directory,
+# and the project root is in PYTHONPATH, or if you run python -m standalone_focus_monitor from root,
+# this should work.
+DASHBOARD_UTILS_AVAILABLE = False
+try:
+    # Ensure the dashboard directory (or its parent if dashboard is a package) is in sys.path
+    # This line is a common pattern but might need adjustment based on your project structure.
+    # If focus_monitor_dashboard.py and standalone_focus_monitor.py are siblings,
+    # and dashboard is a directory containing __init__.py, data_utils.py, etc.
+    # then `from dashboard.data_utils ...` should work if the parent of these files is in PYTHONPATH.
+    
+    # For simplicity, if they are siblings, and 'dashboard' is a directory:
+    # Add the directory *containing* 'dashboard' and this script to the path
+    # if SCRIPT_DIR.parent not in sys.path:
+    #    sys.path.insert(0, str(SCRIPT_DIR.parent))
+
+    from dashboard.data_utils import generate_summary_from_logs as generate_dashboard_summary_file
+    from dashboard.llm_utils import generate_summary_from_raw_with_llm
+    DASHBOARD_UTILS_AVAILABLE = True
+    print("INFO: Dashboard utilities (data_utils, llm_utils) loaded successfully.")
+except ImportError as e:
+    DASHBOARD_UTILS_AVAILABLE = False
+    print(f"WARNING: Dashboard utilities not found or import error ({e}).")
+    print("INFO: Agent will use fallback mechanisms for summaries and LLM features.")
+    print(f"INFO: Python sys.path: {sys.path}")
+    # Define dummy functions if dashboard utils are not available, so agent can still run
+    if 'generate_dashboard_summary_file' not in globals():
+        def generate_dashboard_summary_file(date_str: str) -> Optional[Dict[str, Any]]:
+            print(f"Fallback: generate_dashboard_summary_file called for {date_str} (dashboard_utils not available).")
+            return None 
+    if 'generate_summary_from_raw_with_llm' not in globals():
+        def generate_summary_from_raw_with_llm(titles, ocr, allow_suggestions=True, return_prompt=False) -> Tuple[str, str, str, Optional[str]]:
+            print("Fallback: generate_summary_from_raw_with_llm called (llm_utils not available).")
+            return "LLM utils unavailable", "", "", (None if not return_prompt else "LLM utils unavailable")
+
 
 # Configure logging
 logging.basicConfig(
@@ -46,1004 +105,1187 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.FileHandler(SCRIPT_DIR / "focus_monitor.log", encoding="utf-8"),
-        logging.StreamHandler(),
+        logging.StreamHandler(), # Also print to console
     ],
 )
-logger = logging.getLogger("focus_monitor")
-
-# --- Configuration (Copied for backend calculation consistency) ---
-PRODUCTIVE_EXES = {
-    "code.exe",
-    "pycharm",
-    "idea",
-    "webstorm",
-    "goland",
-    "clion",
-    "word",
-    "excel",
-    "powerpnt",
-    "outlook",
-    "chrome.exe",
-    "firefox.exe",
-    "msedge.exe",
-    "safari",
-    "cmd.exe",
-    "powershell.exe",
-    "terminal",
-    "wt.exe",
-    "explorer.exe",
-    "photoshop",
-    "illustrator",
-    "figma",
-    "xd",
-    "blender",
-    "unity",
-    "docker",
-    "virtualbox",
-    "vmware",
-    "gitkraken",
-    "postman",
-    "obsidian",
-}
-DISTRACTION_EXES = {
-    "steam.exe",
-    "epicgameslauncher",
-    "origin.exe",
-    "gog galaxy",
-    "spotify.exe",
-    "discord.exe",
-    "slack.exe",
-    "netflix",
-    "hulu",
-    "disneyplus",
-    "whatsapp",
-    "telegram",
-    "signal",
-}
-DISTRACTION_TITLE_KEYWORDS = {
-    "youtube",
-    "facebook",
-    "twitter",
-    "reddit",
-    "netflix",
-    "hulu",
-    "twitch",
-    "instagram",
-    "9gag",
-    "game",
-    "play",
-    "tiktok",
-    "pinterest",
-}
-MEETING_EXES = {"teams.exe", "zoom.exe", "webex", "skype.exe", "slack.exe"}
-MEETING_TITLE_KEYWORDS = {
-    "meet",
-    "meeting",
-    "call",
-    "webinar",
-    "huddle",
-    "zoom meeting",
-    "microsoft teams meeting",
-    "google meet",
-}
-OCR_APPS = {"notepad.exe", "word.exe", "acrord32.exe"}
+logger = logging.getLogger("focus_monitor_agent") # More specific logger name
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+logging.getLogger("streamlit.runtime.state.session_state_proxy").setLevel(logging.ERROR)
+# --- Configuration (Agent's own classification rules) ---
+PRODUCTIVE_EXES = {"code.exe", "pycharm.exe", "idea.exe", "webstorm.exe", "goland.exe", "clion.exe", "word.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "chrome.exe", "firefox.exe", "msedge.exe", "cmd.exe", "powershell.exe", "wt.exe", "explorer.exe", "obsidian.exe"}
+DISTRACTION_EXES = {"steam.exe", "epicgameslauncher.exe", "origin.exe", "spotify.exe", "discord.exe", "slack.exe", "netflix.exe", "whatsapp.exe", "telegram.exe"} # Note: Slack can be dual-use
+DISTRACTION_TITLE_KEYWORDS = {"youtube", "facebook", "twitter", "reddit", "netflix", "hulu", "twitch", "instagram", "9gag", "game", "play", "tiktok", "pinterest"}
+MEETING_EXES = {"teams.exe", "zoom.exe", "webex.exe", "skype.exe"} # Note: Slack also used for meetings
+MEETING_TITLE_KEYWORDS = {"meet", "meeting", "call", "webinar", "huddle", "zoom meeting", "microsoft teams meeting", "google meet"}
+OCR_APPS = {"notepad.exe", "wordpad.exe", "acrord32.exe", "sumatrapdf.exe"} # Apps for which to attempt OCR
 
 # --- Browser Profile Detection Patterns ---
 EDGE_PROFILE_PATTERN = re.compile(r"Microsoft Edge(?:\s*-\s*(.+))?$")
-# Chrome typically formats titles as: "Page Title - Google Chrome" or "Page Title - Google Chrome - Profile"
-CHROME_PROFILE_PATTERN = re.compile(r".*Google Chrome(?:\s*-\s*(.+))?$")
+CHROME_PROFILE_PATTERN = re.compile(r".*Google Chrome(?: - (?!New Tab|Settings|History|Downloads|Extensions)(.+))?$") # Improved to avoid common non-profile window parts
 FIREFOX_PROFILE_PATTERN = re.compile(r"Mozilla Firefox(?:\s*-\s*(.+))?$")
+
+# --- Set to True during setup/debugging, False in production ---
+COLOR_DETECTION_DEBUG = True
+
+# Configuration for browser profile color detection
+BROWSER_COLOR_PROFILES = [
+    {
+        "name": "Edge - Personal",
+        "exe_pattern": "msedge.exe",
+        "color_rgb": (7, 43, 71),  # 0x0C4C7D in RGB - UPDATE THIS WITH ACTUAL COLOR
+        "color_tolerance": 15,  # Much stricter tolerance
+        "search_rect": (9, 3, 30, 30),  # Adjust this if needed: (x_offset, y_offset, width, height)
+        "category_id": "personal_browsing"
+    },
+    # Example of how to add more profiles with actual colors you find:
+    # {
+    #     "name": "Edge - Work",
+    #     "exe_pattern": "msedge.exe", 
+    #     "color_rgb": (96, 157, 191),  # Example: if light blue theme is work profile
+    #     "color_tolerance": 15,
+    #     "search_rect": (9, 3, 30, 30), 
+    #     "category_id": "work_browsing"
+    # },
+]
 
 
 class FocusMonitorAgent:
-    def __init__(self, output_dir: Optional[str] = None, api_url: Optional[str] = None):
-        # If no output dir specified, use script directory
-        self.output_dir = Path(output_dir) if output_dir else SCRIPT_DIR
-        self.api_url = api_url
+    def __init__(self, output_dir_str: Optional[str] = None, api_url_str: Optional[str] = None):
+        self.output_dir = Path(output_dir_str) if output_dir_str else SCRIPT_DIR
+        self.api_url = api_url_str
         self.active = True  # Internal current state
-        self.desired_active_state = True  # State requested by backend
+        self.desired_active_state = True  # State requested by backend (if API used)
         self.last_window_info: Optional[Dict] = None
         self.window_start_time: float = time.time()
-        self.today: str = self._get_current_utc_date()
-        self.last_summary_time: float = 0
-        self.summary_interval: int = 300  # Generate summary every 5 minutes
+        self.today: str = self._get_current_utc_date() # Store date as YYYY-MM-DD
+        self.last_summary_time: float = 0 # Initialize to ensure first summary runs
+        self.summary_interval: int = 300  # Generate summary every 5 minutes by default
 
         # Session start timestamp for 5-minute buckets
-        self.session_start_time: float = time.time()
-        self.session_start_tag: str = datetime.datetime.utcfromtimestamp(
-            self.session_start_time
-        ).strftime("%Y%m%dT%H%M%SZ")
-        self.time_buckets: Dict[int, Dict[str, Any]] = {}
+        self.session_start_time: float = time.time() # UTC timestamp for session start
+        self.session_start_tag: str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.time_buckets: Dict[int, Dict[str, Any]] = {} # bucket_index: bucket_data
+        
+        # NEW: Track bucket summarization state
+        self.summarized_buckets: Set[int] = set()  # Track which buckets have been summarized
+        self.current_bucket_index: Optional[int] = None  # Track current active bucket
 
         # Create focus_logs directory within the script or specified directory
         self.focus_logs_dir = self.output_dir / "focus_logs"
         self.focus_logs_dir.mkdir(parents=True, exist_ok=True)
-        self.screenshot_dir = self.focus_logs_dir / "screenshots"
+        self.screenshot_dir = self.focus_logs_dir / "screenshots" # For OCR images
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        self.ocr_last_times: Dict[int, float] = {}
-        self.ocr_results: Dict[int, Dict[str, str]] = {}
+        
+        self.ocr_last_times: Dict[int, float] = {} # hwnd: timestamp of last OCR
+        self.ocr_results_cache: Dict[int, Dict[str, str]] = {} # hwnd: {"text": ..., "path": ...}
 
         logger.info(
-            f"Initialized FocusMonitorAgent (Window Tracking). Output: {self.focus_logs_dir}, API: {self.api_url or 'Disabled'}"
+            f"Initialized FocusMonitorAgent. Output Dir: {self.focus_logs_dir}, API URL: {self.api_url or 'Disabled'}"
         )
+        if not OCR_AVAILABLE:
+            logger.warning("OCR features disabled as pytesseract/Pillow are not available.")
+
+    def _get_monitor_info(self) -> List[Dict[str, int]]:
+        """Get monitor information using Windows API."""
+        monitors = []
+        try:
+            def enum_display_monitors_callback(hmonitor, hdc, rect, data):
+                monitors.append({
+                    'left': rect[0],
+                    'top': rect[1], 
+                    'right': rect[2],
+                    'bottom': rect[3],
+                    'width': rect[2] - rect[0],
+                    'height': rect[3] - rect[1]
+                })
+                return True
+            
+            # Fix the EnumDisplayMonitors call - it takes 4 arguments, not 2
+            win32api.EnumDisplayMonitors(None, None, enum_display_monitors_callback, None)
+            return monitors
+        except Exception:
+            return []
+
+    def analyze_color_region(self, hwnd, target_color_rgb, search_rect, tolerance=20):
+        """
+        Robust color detection using multiple capture methods with Method 3a prioritized.
+        
+        Args:
+            hwnd: Window handle
+            target_color_rgb: Tuple of (R, G, B) values to search for
+            search_rect: Tuple of (x, y, width, height) defining search region relative to window
+            tolerance: How much RGB values can differ and still match (0-255)
+            
+        Returns:
+            bool: True if the color was found in the region, False otherwise
+        """
+        if not OCR_AVAILABLE:
+            return False
+            
+        try:
+            # Get window position and calculate coordinates
+            window_rect = win32gui.GetWindowRect(hwnd)
+            
+            # Calculate absolute coordinates of search region
+            x1 = window_rect[0] + search_rect[0]
+            y1 = window_rect[1] + search_rect[1]
+            x2 = x1 + search_rect[2]
+            y2 = y1 + search_rect[3]
+            
+            capture_bbox_screen = (x1, y1, x2, y2)
+            
+            # Verify the coordinates are valid
+            if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0:
+                return False
+                
+            # Get monitor information
+            monitors = self._get_monitor_info()
+            region_img = None
+            
+            # Method 3a: Try all_screens=True first as it's most robust for multi-monitor
+            if not region_img:
+                grab_all_successful = False
+                try:
+                    if monitors:
+                        min_x_all = min(m['left'] for m in monitors)
+                        min_y_all = min(m['top'] for m in monitors)
+                    else:
+                        min_x_all = 0 
+                        min_y_all = 0
+
+                    full_virtual_desktop_img = ImageGrab.grab(bbox=None, include_layered_windows=False, all_screens=True)
+                    
+                    crop_x1_virtual = capture_bbox_screen[0] - min_x_all
+                    crop_y1_virtual = capture_bbox_screen[1] - min_y_all
+                    crop_x2_virtual = capture_bbox_screen[2] - min_x_all
+                    crop_y2_virtual = capture_bbox_screen[3] - min_y_all
+                    
+                    final_crop_box_virtual = (crop_x1_virtual, crop_y1_virtual, crop_x2_virtual, crop_y2_virtual)
+
+                    if (final_crop_box_virtual[0] >= 0 and final_crop_box_virtual[1] >= 0 and
+                        final_crop_box_virtual[2] <= full_virtual_desktop_img.width and
+                        final_crop_box_virtual[3] <= full_virtual_desktop_img.height and
+                        final_crop_box_virtual[2] > final_crop_box_virtual[0] and
+                        final_crop_box_virtual[3] > final_crop_box_virtual[1]):
+                        region_img = full_virtual_desktop_img.crop(final_crop_box_virtual)
+                        grab_all_successful = True
+
+                except (TypeError, AttributeError):
+                    pass
+                except Exception:
+                    pass
+                
+                if grab_all_successful and region_img:
+                    img_array_check = np.array(region_img)
+                    if img_array_check.size == 0 or (img_array_check.ndim == 3 and img_array_check[:,:,:3].sum() == 0):
+                        region_img = None
+
+            # Method 1: Standard PIL ImageGrab with specific bbox (fallback)
+            if not region_img:
+                try:
+                    region_img = ImageGrab.grab(bbox=capture_bbox_screen)
+                    
+                    if region_img and region_img.size[0] > 0 and region_img.size[1] > 0:
+                        img_array_check = np.array(region_img)
+                        if img_array_check.size == 0 or (img_array_check.ndim == 3 and img_array_check[:,:,:3].sum() == 0):
+                            region_img = None
+                    else:
+                        region_img = None
+                        
+                except Exception:
+                    region_img = None
+            
+            # Method 2: Try grabbing entire primary screen first, then crop (fallback)
+            if not region_img:
+                try:
+                    full_primary_img = ImageGrab.grab()
+                    
+                    primary_crop_x1 = max(0, capture_bbox_screen[0])
+                    primary_crop_y1 = max(0, capture_bbox_screen[1])
+                    primary_crop_x2 = min(full_primary_img.width, capture_bbox_screen[2])
+                    primary_crop_y2 = min(full_primary_img.height, capture_bbox_screen[3])
+                    
+                    primary_crop_box = (primary_crop_x1, primary_crop_y1, primary_crop_x2, primary_crop_y2)
+                    
+                    if (primary_crop_x2 > primary_crop_x1 and primary_crop_y2 > primary_crop_y1 and
+                        primary_crop_x1 >= 0 and primary_crop_y1 >= 0):
+                        region_img = full_primary_img.crop(primary_crop_box)
+                        
+                        img_array_check = np.array(region_img)
+                        if img_array_check.size == 0 or (img_array_check.ndim == 3 and img_array_check[:,:,:3].sum() == 0):
+                            region_img = None
+                        
+                except Exception:
+                    region_img = None
+
+            # Method 3b: Try all monitors capture (if 3a failed and EnumDisplayMonitors works)
+            if not region_img and monitors:
+                try:
+                    min_x_all = min(m['left'] for m in monitors)
+                    min_y_all = min(m['top'] for m in monitors)
+                    max_x_all = max(m['right'] for m in monitors)
+                    max_y_all = max(m['bottom'] for m in monitors)
+                    
+                    all_monitors_rect = (min_x_all, min_y_all, max_x_all, max_y_all)
+                    full_all_monitors_img = ImageGrab.grab(bbox=all_monitors_rect)
+                    
+                    crop_x1_all = capture_bbox_screen[0] - min_x_all
+                    crop_y1_all = capture_bbox_screen[1] - min_y_all
+                    crop_x2_all = capture_bbox_screen[2] - min_x_all
+                    crop_y2_all = capture_bbox_screen[3] - min_y_all
+                    
+                    final_crop_box_all = (crop_x1_all, crop_y1_all, crop_x2_all, crop_y2_all)
+                    
+                    if (final_crop_box_all[0] >= 0 and final_crop_box_all[1] >= 0 and
+                        final_crop_box_all[2] <= full_all_monitors_img.width and
+                        final_crop_box_all[3] <= full_all_monitors_img.height and
+                        final_crop_box_all[2] > final_crop_box_all[0] and
+                        final_crop_box_all[3] > final_crop_box_all[1]):
+                        region_img = full_all_monitors_img.crop(final_crop_box_all)
+                        
+                        img_array_check = np.array(region_img)
+                        if img_array_check.size == 0 or (img_array_check.ndim == 3 and img_array_check[:,:,:3].sum() == 0):
+                            region_img = None
+                        
+                except Exception:
+                    region_img = None
+            
+            if not region_img:
+                return False
+                
+            # Save debug image if debug is enabled
+            if COLOR_DETECTION_DEBUG:
+                debug_filename = f"color_debug_{int(time.time())}_{hwnd}.png"
+                debug_filepath = self.screenshot_dir / debug_filename
+                region_img.save(debug_filepath)
+            
+            # Convert to numpy array for color analysis
+            img_array = np.array(region_img)
+            
+            # Add minimum percentage threshold to avoid false positives from random pixels
+            MIN_MATCH_PERCENTAGE = 1.0  # At least 1% of pixels must match
+            
+            r_match = np.abs(img_array[:,:,0] - target_color_rgb[0]) <= tolerance
+            g_match = np.abs(img_array[:,:,1] - target_color_rgb[1]) <= tolerance
+            b_match = np.abs(img_array[:,:,2] - target_color_rgb[2]) <= tolerance
+            
+            # Combine the matches - we need all three channels to match
+            color_match = np.logical_and(r_match, np.logical_and(g_match, b_match))
+            
+            # Calculate percentage of matching pixels
+            total_pixels = color_match.size
+            matching_pixels = np.sum(color_match)
+            match_percentage = (matching_pixels / total_pixels) * 100
+            
+            # Check if we have enough matching pixels to be confident
+            has_any_match = np.any(color_match)
+            meets_threshold = match_percentage >= MIN_MATCH_PERCENTAGE
+            
+            # Final result: must have matches AND meet minimum percentage
+            result = has_any_match and meets_threshold
+            
+            return result
+                
+        except Exception:
+            return False
+
+    def _check_color_profiles_for_window(self, hwnd, exe_path, window_title):
+        """
+        Checks if the window matches any of the color profiles and returns the matching category ID.
+        First verifies that we're dealing with Edge before attempting color detection.
+        When a color match is found, the window is automatically categorized.
+        
+        Args:
+            hwnd: Window handle
+            exe_path: Path to the executable
+            window_title: Window title
+            
+        Returns:
+            str: Category ID from matching profile, or empty string if no match
+        """
+        # First, check if this is Edge - only proceed with color detection for Edge
+        exe_basename = os.path.basename(exe_path).lower()
+        
+        if "msedge.exe" not in exe_basename:
+            return ""  # Skip color detection for non-Edge windows
+        
+        # Only check profiles for Edge
+        matching_profiles = [p for p in BROWSER_COLOR_PROFILES if p["exe_pattern"].lower() in exe_basename]
+        
+        for profile in matching_profiles:
+            # Check if the color is present in the defined region using the robust method
+            if self.analyze_color_region(
+                hwnd, 
+                profile["color_rgb"], 
+                profile["search_rect"], 
+                profile.get("color_tolerance", 20)
+            ):
+                # Color match found - automatically categorize this window
+                category_id = profile["category_id"]
+                logger.info(f"🎯 COLOR MATCH: Window '{window_title[:50]}' automatically categorized as '{category_id}' based on profile '{profile['name']}'")
+                return category_id
+        
+        return ""  # No match found
 
     def _get_current_utc_date(self) -> str:
-        # Make sure to use UTC date for consistency
-        current_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        logger.debug(f"Current UTC date: {current_date}")
-        return current_date
+        # Use UTC date for consistency across timezones
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
     async def check_backend_status(self):
-        """Periodically check the desired active state from the backend."""
+        """Periodically check the desired active state from the backend (if API URL is set)."""
         while True:
             if not self.api_url:
                 self.desired_active_state = True  # Default to active if no API
-                await asyncio.sleep(60)
+                await asyncio.sleep(60) # Check less frequently if no API
                 continue
             try:
-                response = requests.get(f"{self.api_url}/focus/status", timeout=3)
+                response = requests.get(f"{self.api_url}/focus/status", timeout=5) # Increased timeout
                 response.raise_for_status()
                 new_desired_state = response.json().get("active", True)
                 if self.desired_active_state != new_desired_state:
                     logger.info(
-                        f"Backend desired state changed to: {new_desired_state}"
+                        f"Backend desired state changed from '{self.desired_active_state}' to '{new_desired_state}'"
                     )
                     self.desired_active_state = new_desired_state
             except requests.exceptions.RequestException as e:
                 logger.warning(
-                    f"Could not reach backend ({self.api_url}) to check focus status: {e}"
+                    f"Could not reach backend API ({self.api_url}) to check focus status: {e}"
                 )
-            except Exception as e:
-                logger.error(f"Error checking backend status: {e}")
+            except Exception as e: # Catch other potential errors like JSONDecodeError
+                logger.error(f"Error checking backend status via API: {e}")
             await asyncio.sleep(15)  # Check every 15 seconds
 
     def toggle_active(self):
         """Toggle the internal active state if it differs from desired state."""
         if self.active == self.desired_active_state:
-            return
+            return # No change needed
 
-        new_state = self.desired_active_state
-        logger.info(f"Focus Monitor internal state changing to: {new_state}")
+        new_internal_state = self.desired_active_state
+        logger.info(f"Focus Monitor internal active state changing to: {new_internal_state}")
 
-        if not new_state:  # Pausing
-            if self.last_window_info:
+        if not new_internal_state:  # Pausing
+            if self.last_window_info: # Log any pending activity
                 duration = int(time.time() - self.window_start_time)
                 if duration > 0:
                     self._log_window_activity(self.last_window_info, duration)
-            self.last_window_info = None
-            self.window_start_time = time.time()
+            self.last_window_info = None # Clear last window info when paused
+            # self.window_start_time = time.time() # Reset start time, or keep it to measure pause duration?
+                                               # For now, reset as if a new window (idle) started.
         else:  # Resuming
-            self.window_start_time = time.time()  # Reset start time
+            pass # window_start_time will be set when a new window is focused
+        
+        self.window_start_time = time.time() # Reset window timer on any state change
+        self.active = new_internal_state
 
-        self.active = new_state
-
-    def _extract_browser_profile(
-        self, exe: str, title: str, pid: int = 0
-    ) -> Optional[str]:
-        """Extract browser profile information from window title or process details if available."""
-        # First try to detect from window title
-        if "msedge.exe" in exe.lower():
-            match = EDGE_PROFILE_PATTERN.search(title)
+    def _extract_browser_profile(self, exe_path: str, window_title: str, process_id: int = 0) -> Optional[str]:
+        """Extract browser profile information from window title or process details."""
+        exe_basename_lower = os.path.basename(exe_path).lower()
+        
+        if "msedge.exe" == exe_basename_lower:
+            match = EDGE_PROFILE_PATTERN.search(window_title)
+            if match and match.group(1): return match.group(1).strip()
+        elif "chrome.exe" == exe_basename_lower:
+            # WMI based profile detection can be complex and permission-heavy.
+            # Title-based is often sufficient and more portable.
+            # If you need WMI:
+            # if process_id > 0:
+            #     profile_from_pid = self._get_chrome_profile_from_pid_wmi(process_id) # Ensure WMI is imported if used
+            #     if profile_from_pid: return profile_from_pid
+            match = CHROME_PROFILE_PATTERN.search(window_title) # Uses improved regex
             if match and match.group(1):
                 return match.group(1).strip()
-        elif "chrome.exe" in exe.lower():
-            # First check direct profile path from process command line
-            if pid > 0:
-                try:
-                    # Try to get the profile directory from the command line
-                    profile = self._get_chrome_profile_from_pid(pid)
-                    if profile:
-                        return profile
-                except Exception as e:
-                    logger.debug(f"Error getting Chrome profile from pid: {e}")
-
-            # Fall back to window title detection
-            match = CHROME_PROFILE_PATTERN.search(title)
-            if match and match.group(1):
-                # Chrome profiles might have extra spaces or text, clean it up
-                profile = match.group(1).strip()
-                # If the profile contains common Chrome text, it's probably not a profile name
-                if profile.lower() in ["new tab", "settings", "history"]:
-                    return None
-                return profile
-        elif "firefox.exe" in exe.lower():
-            match = FIREFOX_PROFILE_PATTERN.search(title)
-            if match and match.group(1):
-                return match.group(1).strip()
+        elif "firefox.exe" == exe_basename_lower:
+            match = FIREFOX_PROFILE_PATTERN.search(window_title)
+            if match and match.group(1): return match.group(1).strip()
         return None
 
-    def _get_chrome_profile_from_pid(self, pid: int) -> Optional[str]:
-        """Extract Chrome profile name from process command line arguments."""
-        try:
-            # Open the process with necessary access rights
-            handle = win32api.OpenProcess(
-                win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
-                False,
-                pid,
-            )
-            if not handle:
-                return None
-
-            try:
-                # Get the full command line
-                import ctypes
-                from ctypes import wintypes
-
-                GetProcessCommandLine = ctypes.windll.kernel32.GetProcessCommandLine
-                GetProcessCommandLine.argtypes = [
-                    wintypes.HANDLE,
-                    wintypes.LPWSTR,
-                    wintypes.DWORD,
-                ]
-                GetProcessCommandLine.restype = wintypes.BOOL
-
-                buffer_size = 8192  # Max command line size
-                buffer = ctypes.create_unicode_buffer(buffer_size)
-
-                # This direct approach doesn't work because GetProcessCommandLine isn't exposed properly
-                # Instead, we'll use WMI to get this information
-
-                # Alternative approach using WMI
-                import wmi
-
-                c = wmi.WMI()
-                for process in c.Win32_Process(ProcessId=pid):
-                    cmd_line = process.CommandLine
-                    if cmd_line:
-                        # Look for --profile-directory="ProfileName" or --profile-directory=ProfileName
-                        profile_match = re.search(
-                            r"--profile-directory[=\s]\"?([^\"]+)\"?", cmd_line
-                        )
-                        if profile_match:
-                            profile_dir = profile_match.group(1).strip()
-                            # Convert profile directory to a friendly name
-                            # Default is "Default", others are typically named "Profile 1", "Profile 2", etc.
-                            # or custom names like "Work", "Personal", etc.
-                            if profile_dir == "Default":
-                                return "Default"
-                            elif profile_dir.startswith("Profile "):
-                                return f"Profile {profile_dir.split(' ')[1]}"
-                            else:
-                                # Try to map the directory to a user-friendly name
-                                return self._get_chrome_profile_name_from_dir(
-                                    profile_dir
-                                )
-                return None
-            finally:
-                win32api.CloseHandle(handle)
-        except Exception as e:
-            logger.debug(f"Error getting Chrome command line: {e}")
-            return None
-
-    def _get_chrome_profile_name_from_dir(self, profile_dir: str) -> str:
-        """Try to map Chrome profile directory to user-friendly name."""
-        # Chrome user data directory is typically at:
-        # C:\Users\<username>\AppData\Local\Google\Chrome\User Data\
-
-        try:
-            # Common locations for Chrome user data
-            user_data_dirs = [
-                os.path.expanduser(r"~\AppData\Local\Google\Chrome\User Data"),
-                os.path.expanduser(r"~\AppData\Local\Chromium\User Data"),
-                os.path.expanduser(r"~\AppData\Local\Google\Chrome Beta\User Data"),
-                os.path.expanduser(r"~\AppData\Local\Google\Chrome Dev\User Data"),
-            ]
-
-            # Try to find the Preferences file for this profile
-            for user_data_dir in user_data_dirs:
-                prefs_file = os.path.join(user_data_dir, profile_dir, "Preferences")
-                if os.path.exists(prefs_file):
-                    try:
-                        with open(prefs_file, "r", encoding="utf-8") as f:
-                            prefs = json.load(f)
-                            # Extract profile name from preferences
-                            if "profile" in prefs and "name" in prefs["profile"]:
-                                return prefs["profile"]["name"]
-                    except Exception as e:
-                        logger.debug(f"Error reading Chrome preferences: {e}")
-
-            # If we can't find a friendly name, return the directory name
-            return profile_dir
-        except Exception as e:
-            logger.debug(f"Error mapping Chrome profile directory: {e}")
-            return profile_dir
-
-    def _get_app_identity(self, exe: str, title: str) -> Tuple[str, str]:
-        """Generate a consistent app identity that includes profile info for browsers."""
-        profile = self._extract_browser_profile(exe, title)
-
+    def _get_app_identity(self, exe_path: str, window_title: str, process_id: int = 0) -> Tuple[str, str]:
+        """
+        Generate a consistent app identity string. For browsers, this may include profile info.
+        Returns (app_identity_string, original_exe_path).
+        """
+        profile_name = self._extract_browser_profile(exe_path, window_title, process_id)
+        
         # Default app name is the executable basename without .exe
-        app_name = (
-            os.path.basename(exe).replace(".exe", "") if exe != "Unknown" else "Unknown"
-        )
+        app_basename = os.path.basename(exe_path).lower()
+        app_name_without_ext = app_basename.replace(".exe", "") if app_basename.endswith(".exe") else app_basename
+        
+        if app_name_without_ext == "unknown": # Handle cases where exe path couldn't be determined
+            return "Unknown Application", exe_path
+
+        # Check for color profile match for browsers - only for Edge
+        if app_name_without_ext == "msedge" and process_id > 0:
+            try:
+                hwnd = win32gui.GetForegroundWindow()  # Use the current foreground window
+                profile_category_id = self._check_color_profiles_for_window(hwnd, exe_path, window_title)
+                if profile_category_id:
+                    # Find the profile name from the category
+                    profile_name = next((p["name"] for p in BROWSER_COLOR_PROFILES 
+                                      if p["category_id"] == profile_category_id), None)
+                    if profile_name:
+                        return f"{app_name_without_ext} - {profile_name}", exe_path
+            except Exception as e:
+                logger.debug(f"Error in color profile detection for app identity: {e}")
 
         # For browsers with profile info, append the profile to the app name
-        if profile:
-            if "msedge.exe" in exe.lower():
-                return f"{app_name} - {profile}", exe
-            elif "chrome.exe" in exe.lower():
-                return f"{app_name} - {profile}", exe
-            elif "firefox.exe" in exe.lower():
-                return f"{app_name} - {profile}", exe
+        if profile_name:
+            # Check if it's a known browser where profiles are significant
+            known_browsers = ["chrome", "msedge", "firefox"]
+            if any(browser_name in app_name_without_ext for browser_name in known_browsers):
+                return f"{app_name_without_ext} - {profile_name}", exe_path
 
-        # Special case for Chrome - check if we can infer the profile from page content
-        if "chrome.exe" in exe.lower() and not profile:
-            # Check for domains that might indicate work vs personal
-            title_lower = title.lower()
+        # If no specific profile, just return the base app name
+        return app_name_without_ext, exe_path
 
-            # Work-related domains
-            if any(
-                domain in title_lower
-                for domain in [
-                    "jira",
-                    "confluence",
-                    "slack",
-                    "teams",
-                    "github",
-                    "gitlab",
-                    "azure",
-                    "office365",
-                ]
-            ):
-                return f"{app_name} - Work", exe
-
-            # Entertainment domains
-            if any(
-                domain in title_lower
-                for domain in [
-                    "youtube",
-                    "netflix",
-                    "twitch",
-                    "spotify",
-                    "reddit",
-                    "facebook",
-                    "instagram",
-                ]
-            ):
-                return f"{app_name} - Personal", exe
-
-            # If we can't infer, just return the app name
-            return app_name, exe
-
-        return app_name, exe
-
-    def _get_focused_window_details(self) -> Optional[Dict]:
-        """Get details (hwnd, pid, exe, title, timestamp) for the currently focused window."""
+    def _get_focused_window_details(self) -> Optional[Dict[str, Any]]:
+        """Get details (hwnd, pid, exe, title, timestamp, etc.) for the currently focused window."""
         try:
             hwnd = win32gui.GetForegroundWindow()
-            if not hwnd:
-                return None
+            if not hwnd: return None # No window in foreground
 
-            title = win32gui.GetWindowText(hwnd)
-            tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+            window_title = win32gui.GetWindowText(hwnd)
+            # GetWindowThreadProcessId returns (threadId, processId)
+            _thread_id, process_id = win32process.GetWindowThreadProcessId(hwnd)
 
-            if (
-                not title
-                or pid == 0
-                or title
-                in [
-                    "Program Manager",
-                    "Windows Default Lock Screen",
-                    "Windows Input Experience",
-                ]
-            ):
-                return None  # Filter out uninteresting windows
+            # Filter out uninteresting windows (e.g., desktop, lock screen)
+            if not window_title or process_id == 0 or window_title in [
+                "Program Manager", "Windows Default Lock Screen", "Windows Input Experience", "Action center"
+            ]:
+                return None 
 
-            exe = "Unknown"
+            exe_full_path = "Unknown"
             try:
-                # PROCESS_QUERY_LIMITED_INFORMATION is safer if available
-                handle = win32api.OpenProcess(
-                    win32con.PROCESS_QUERY_LIMITED_INFORMATION
-                    | win32con.PROCESS_VM_READ,
-                    False,
-                    pid,
-                )
-                if handle:
+                #PROCESS_QUERY_LIMITED_INFORMATION is safer if available and often sufficient
+                h_process = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.PROCESS_VM_READ, False, process_id)
+                if h_process:
                     try:
-                        exe = win32process.GetModuleFileNameEx(handle, 0)
+                        exe_full_path = win32process.GetModuleFileNameEx(h_process, 0)
                     finally:
-                        win32api.CloseHandle(handle)
-            except Exception:
-                pass  # Ignore permission errors
+                        win32api.CloseHandle(h_process)
+            except Exception as e_proc:
+                # logger.debug(f"Could not get exe for pid {process_id} (title: {window_title[:30]}...): {e_proc}")
+                pass # Silently pass if exe cannot be retrieved, will log "Unknown"
 
-            # Extract profile info if available - pass PID for Chrome profile detection
-            profile = self._extract_browser_profile(exe, title, pid)
+            # Attempt OCR if applicable and enabled
+            ocr_text_content = None
+            screenshot_file_rel_path = None # Relative path to save in log
 
-            ocr_text = None
-            screenshot_path = None
-            exe_lower = os.path.basename(exe).lower()
-            if exe_lower in OCR_APPS:
-                last_time = self.ocr_last_times.get(hwnd, 0)
-                if time.time() - last_time >= 10:
+            if OCR_AVAILABLE and os.path.basename(exe_full_path).lower() in OCR_APPS:
+                last_ocr_capture_time = self.ocr_last_times.get(hwnd, 0)
+                # OCR same window at most every 10 seconds to reduce overhead
+                if time.time() - last_ocr_capture_time >= 10:
                     try:
-                        image = ImageGrab.grab()
-                        screenshot_path = (
-                            self.screenshot_dir / f"{int(time.time())}_{hwnd}.png"
-                        )
-                        image.save(screenshot_path)
-                        ocr_text = pytesseract.image_to_string(image)
-                        self.ocr_last_times[hwnd] = time.time()
-                        self.ocr_results[hwnd] = {
-                            "text": ocr_text,
-                            "path": str(screenshot_path),
-                        }
-                    except Exception as e:
-                        logger.error(f"OCR capture failed: {e}")
+                        # Capture only the active window's bounding box for better OCR accuracy
+                        window_rect = win32gui.GetWindowRect(hwnd)
+                        # ImageGrab.grab can take a bbox argument. Ensure it's not an empty rect.
+                        if window_rect[2] > window_rect[0] and window_rect[3] > window_rect[1]:
+                            captured_image = ImageGrab.grab(bbox=window_rect)
+                            # Create a unique filename for the screenshot
+                            timestamp_filename_part = int(time.time())
+                            hwnd_filename_part = hwnd if hwnd else "nohwnd" # Handle if hwnd is 0 (unlikely here)
+                            screenshot_filename = f"{timestamp_filename_part}_{hwnd_filename_part}.png"
+                            
+                            full_screenshot_path = self.screenshot_dir / screenshot_filename
+                            captured_image.save(full_screenshot_path)
+                            
+                            ocr_text_content = pytesseract.image_to_string(captured_image)
+                            screenshot_file_rel_path = str(Path("screenshots") / screenshot_filename) # Store relative path
+
+                            self.ocr_last_times[hwnd] = time.time()
+                            # Cache result in case window changes before next log write
+                            self.ocr_results_cache[hwnd] = {"text": ocr_text_content, "path": screenshot_file_rel_path}
+                            logger.debug(f"OCR captured for '{window_title[:30]}...': {ocr_text_content[:50]}...")
+                    except Exception as e_ocr_capture:
+                        logger.error(f"OCR capture failed for '{window_title[:30]}...': {e_ocr_capture}")
+            
+            # Get the app identity (potentially with profile)
+            app_identity_name, _ = self._get_app_identity(exe_full_path, window_title, process_id)
 
             return {
-                "hwnd": hwnd,
-                "pid": pid,
-                "exe": exe,
-                "title": title,
-                "app_profile": profile,
+                "hwnd": hwnd, "pid": process_id, 
+                "exe": exe_full_path, # Store the full original exe path
+                "title": window_title,
+                "app_name_identity": app_identity_name, # This is the name used for initial logging (app_name field)
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "ocr_text": ocr_text,
-                "screenshot_path": str(screenshot_path) if screenshot_path else None,
+                "ocr_text": ocr_text_content, # From current capture attempt, if any
+                "screenshot_path": screenshot_file_rel_path, # Relative path, if any
             }
-        except Exception as e:
-            if "pywintypes.error" in str(type(e)) and e.args[0] in [
-                0,
-                1400,
-            ]:  # Handle window closing during check
-                logger.debug(f"Window likely closed during info retrieval: {e}")
-                return None
-            logger.error(f"Error getting focused window details: {e}", exc_info=False)
+        except Exception as e_main_details:
+            # Handle specific pywintypes errors that occur if a window closes during query
+            if "pywintypes.error" in str(type(e_main_details)) and hasattr(e_main_details, 'args') and e_main_details.args and e_main_details.args[0] in [0, 5, 1400]: # 5: Access Denied, 1400: Invalid window handle
+                logger.debug(f"Window likely closed or inaccessible during info retrieval: {e_main_details}")
+            else:
+                logger.error(f"Error getting focused window details: {e_main_details}", exc_info=False) # exc_info=False to reduce log noise for common errors
             return None
 
-    def _log_window_activity(
-        self,
-        window_info: Dict,
-        duration: int,
-        ocr_text: Optional[str] = None,
-        screenshot_path: Optional[str] = None,
-    ):
-        """Log focused window activity to JSONL file.
-
-        Additional fields such as OCR text or screenshot path can be provided
-        either via the optional parameters or within ``window_info`` itself.
-        These fields are only written when present so older logs remain
-        compatible.
-        """
-        if duration <= 0:
-            return
+    def _log_window_activity(self, window_info: Dict[str, Any], duration_seconds: int):
+        """Log focused window activity to a JSONL file."""
+        if duration_seconds <= 0: return
         try:
-            self.focus_logs_dir.mkdir(parents=True, exist_ok=True)
-            log_file = self.focus_logs_dir / f"focus_log_{self.today}.jsonl"
+            # focus_logs_dir is already ensured by __init__
+            log_file_path = self.focus_logs_dir / f"focus_log_{self.today}.jsonl"
 
-            app_identity, exe_path = self._get_app_identity(
-                window_info["exe"], window_info["title"]
-            )
+            # The 'app_name' in the log should be the identity potentially including profile.
+            # This is used by dashboard_utils.generate_summary_from_logs for initial aggregation.
+            # The dashboard's apply_labels_to_logs will then create 'original_app_name' and a new 'app_name' based on labels.
+            app_name_to_log = window_info.get("app_name_identity", os.path.basename(window_info.get("exe","Unknown")).replace(".exe",""))
 
-            log_entry = {
+            log_entry: Dict[str, Any] = {
                 "timestamp": window_info["timestamp"],
-                "exe": window_info["exe"],
-                "app_name": app_identity,
-                "app_profile": window_info.get("app_profile"),
+                "exe": window_info["exe"], # Full original exe path
+                "app_name": app_name_to_log, # This is the name used by dashboard for initial grouping
                 "title": window_info["title"],
-                "duration": duration,
+                "duration": duration_seconds,
                 "pid": window_info.get("pid", 0),
             }
 
-            # Handle OCR info
+            # Check for color profile match if it's a browser window
             hwnd = window_info.get("hwnd")
-            ocr_info = self.ocr_results.pop(hwnd, None) if hwnd else None
-            if ocr_info:
-                log_entry["ocr_text"] = ocr_info.get("text")
-                log_entry["screenshot_path"] = ocr_info.get("path")
-            else:
-                if ocr_text:
-                    log_entry["ocr_text"] = ocr_text
-                if screenshot_path:
-                    log_entry["screenshot_path"] = screenshot_path
-                else:
-                    if window_info.get("ocr_text"):
-                        log_entry["ocr_text"] = window_info["ocr_text"]
-                    if window_info.get("screenshot_path"):
-                        log_entry["screenshot_path"] = window_info["screenshot_path"]
+            if hwnd:
+                # Note: _check_color_profiles_for_window will internally check if it's Edge
+                profile_category_id = self._check_color_profiles_for_window(
+                    hwnd, window_info["exe"], window_info["title"]
+                )
+                if profile_category_id:
+                    # Store the detected profile category in the log entry for later use
+                    log_entry["detected_profile_category"] = profile_category_id
+                    # Also update the app_name to reflect the detected category
+                    profile_name = next((p["name"] for p in BROWSER_COLOR_PROFILES 
+                                      if p["category_id"] == profile_category_id), profile_category_id)
+                    log_entry["app_name"] = f"msedge - {profile_name}"
+                    logger.info(f"🎯 CATEGORIZED: Window automatically categorized and logged as '{log_entry['app_name']}' with category '{profile_category_id}'")
 
-            if hwnd in self.ocr_last_times:
-                self.ocr_last_times.pop(hwnd, None)
 
-            with open(log_file, "a", encoding="utf-8") as f:
+            # Add OCR info if available from current capture or cache
+            hwnd = window_info.get("hwnd")
+            cached_ocr = self.ocr_results_cache.pop(hwnd, None) if hwnd else None
+            
+            current_ocr_text = window_info.get("ocr_text")
+            current_screenshot_path = window_info.get("screenshot_path")
+
+            if current_ocr_text: log_entry["ocr_text"] = current_ocr_text
+            elif cached_ocr: log_entry["ocr_text"] = cached_ocr.get("text")
+            
+            if current_screenshot_path: log_entry["screenshot_path"] = current_screenshot_path
+            elif cached_ocr: log_entry["screenshot_path"] = cached_ocr.get("path")
+
+            # Clean up OCR timestamp cache if entry processed
+            if hwnd in self.ocr_last_times: self.ocr_last_times.pop(hwnd, None)
+
+            with open(log_file_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
 
-            title_snip = log_entry["title"][:60].replace("\n", " ") + (
-                "..." if len(log_entry["title"]) > 60 else ""
-            )
-            profile_info = (
-                f" ({log_entry['app_profile']})" if log_entry.get("app_profile") else ""
-            )
-            logger.info(
-                f"Logged: {app_identity}{profile_info} - '{title_snip}' ({duration}s)"
-            )
+            # Log a snippet for quick console feedback
+            title_snippet = log_entry["title"][:60].replace("\n", " ") + ("..." if len(log_entry["title"]) > 60 else "")
+            logger.info(f"Logged: {log_entry['app_name']} - '{title_snippet}' ({duration_seconds}s)")
 
-            self._update_time_bucket(log_entry)
-        except Exception as e:
-            logger.error(f"Error writing to log file {log_file}: {e}")
+            # Update in-memory time bucket with this activity
+            self._update_time_bucket(log_entry) # Pass the full log_entry
 
-    def _update_time_bucket(self, log_entry: Dict):
+        except Exception as e_log:
+            logger.error(f"Error writing to log file {log_file_path}: {e_log}")
+
+    def _update_time_bucket(self, log_entry_data: Dict[str, Any]):
         """Update the in-memory 5-minute bucket summary with a new log entry."""
         try:
-            ts = datetime.datetime.fromisoformat(log_entry["timestamp"]).timestamp()
-        except Exception:
-            ts = time.time()
+            # Timestamp from log_entry is already UTC ISO format
+            log_ts = datetime.datetime.fromisoformat(log_entry_data["timestamp"]).timestamp() # Convert to UNIX timestamp
+        except ValueError:
+            log_ts = time.time() # Fallback if ISO format is wrong
 
-        bucket_index = int((ts - self.session_start_time) // 300)
-        bucket_start = self.session_start_time + bucket_index * 300
-        bucket_end = bucket_start + 300
+        # Calculate bucket index based on session start time
+        bucket_index = int((log_ts - self.session_start_time) // 300) # 300 seconds = 5 minutes
+        
+        # Check if we've moved to a new bucket
+        if self.current_bucket_index is not None and bucket_index != self.current_bucket_index:
+            # We've moved to a new bucket, so summarize the previous one
+            self._finalize_bucket_summary(self.current_bucket_index)
+        
+        self.current_bucket_index = bucket_index
+        
+        # Define bucket start and end times based on the index
+        current_bucket_start_ts = self.session_start_time + (bucket_index * 300)
+        current_bucket_end_ts = current_bucket_start_ts + 300
 
-        bucket = self.time_buckets.setdefault(
+        # Retrieve or initialize the bucket
+        bucket_data = self.time_buckets.setdefault(
             bucket_index,
             {
-                "start": datetime.datetime.utcfromtimestamp(bucket_start).isoformat(),
-                "end": datetime.datetime.utcfromtimestamp(bucket_end).isoformat(),
-                "apps": set(),
-                "titles": set(),
-                "ocr_text": set(),
-                "summary": "",
-            },
+                "start": datetime.datetime.fromtimestamp(current_bucket_start_ts, tz=datetime.timezone.utc).isoformat(),
+                "end": datetime.datetime.fromtimestamp(current_bucket_end_ts, tz=datetime.timezone.utc).isoformat(),
+                "apps": set(), "titles": set(), "ocr_text": set(), 
+                "summary": "", "category_id": "" # Placeholders for LLM output
+            }
         )
 
-        bucket["apps"].add(log_entry.get("app_name", "Unknown"))
-        if log_entry.get("title"):
-            bucket["titles"].add(log_entry["title"])
-        if log_entry.get("ocr_text"):
-            bucket["ocr_text"].add(log_entry["ocr_text"])
+        # Add data from current log entry to the bucket's sets
+        bucket_data["apps"].add(log_entry_data.get("app_name", "Unknown")) # app_name includes profile if any
+        if log_entry_data.get("title"): bucket_data["titles"].add(log_entry_data["title"])
+        if log_entry_data.get("ocr_text"): bucket_data["ocr_text"].add(log_entry_data["ocr_text"])
+        
+        # If this log entry has a detected profile category from color detection, use it
+        if log_entry_data.get("detected_profile_category"):
+            bucket_data["category_id"] = log_entry_data["detected_profile_category"]
+            logger.debug(f"Setting bucket category to '{bucket_data['category_id']}' based on color profile detection")
 
-        self._generate_bucket_summary(bucket)
+    def _finalize_bucket_summary(self, bucket_index: int):
+        """Generate LLM summary for a completed bucket (when we move to the next bucket)."""
+        if bucket_index in self.summarized_buckets:
+            return  # Already summarized
+            
+        if bucket_index not in self.time_buckets:
+            return  # Bucket doesn't exist
+            
+        bucket_data = self.time_buckets[bucket_index]
+        
+        # Generate summary for this completed bucket
+        self._generate_bucket_summary(bucket_data)
+        
+        # Mark as summarized
+        self.summarized_buckets.add(bucket_index)
+        
+        logger.info(f"Finalized summary for bucket {bucket_index} ({bucket_data.get('start', '')})")
 
-    def _generate_bucket_summary(self, bucket: Dict):
-        """Summarize a time bucket using Ollama and store the result."""
+    def _generate_bucket_summary(self, bucket_dict_to_update: Dict[str, Any]):
+        """
+        Summarize a time bucket using LLM (if available) and store the result in the bucket_dict.
+        This is now only called when a bucket is complete.
+        """
+        if not DASHBOARD_UTILS_AVAILABLE or 'generate_summary_from_raw_with_llm' not in globals():
+            logger.debug("LLM utils for bucket summary not available. Skipping LLM summarization for bucket.")
+            bucket_dict_to_update.setdefault("summary", "LLM utils unavailable for agent summarization.")
+            bucket_dict_to_update.setdefault("category_id", "")
+            return
+
         try:
-            text_parts = list(bucket.get("titles", set())) + list(
-                bucket.get("ocr_text", set())
-            )
-            if not text_parts:
-                bucket["summary"] = ""
+            # Get titles and OCR text from the bucket (which are sets)
+            titles_list = list(bucket_dict_to_update.get("titles", set()))
+            ocr_text_list = list(bucket_dict_to_update.get("ocr_text", set()))
+            
+            if not titles_list and not ocr_text_list: # No content to summarize
+                bucket_dict_to_update["summary"] = "No activity detected"
+                bucket_dict_to_update["category_id"] = ""
                 return
 
-            prompt = "Summarize the following activity:\n" + "\n".join(text_parts)
-            resp = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": "llama3.1:8b", "prompt": prompt, "stream": False},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            bucket["summary"] = data.get("response", "").strip()
-        except Exception as e:
-            logger.error(f"Error generating bucket summary: {e}")
-            bucket.setdefault("summary", "")
+            logger.info(f"Generating LLM summary for bucket {bucket_dict_to_update.get('start', '')} with {len(titles_list)} titles and {len(ocr_text_list)} OCR texts")
+
+            # Use the refactored LLM utility from dashboard.llm_utils
+            # allow_suggestions=False for the agent, as it just records. UI handles suggestions.
+            # The fourth element (prompt_text) is ignored by the agent.
+            summary_text, category_id, _suggested_category, _ = generate_summary_from_raw_with_llm(
+                titles_list, ocr_text_list, allow_suggestions=False, return_prompt=False
+            ) 
+
+            bucket_dict_to_update["summary"] = summary_text if summary_text else ""
+            bucket_dict_to_update["category_id"] = category_id if category_id else ""
+            logger.info(f"Bucket summarized. Summary: '{summary_text[:50]}...', Category: {category_id or 'None'}")
+
+        except Exception as e_llm_bucket:
+            logger.error(f"Error generating bucket summary using llm_utils: {e_llm_bucket}")
+            bucket_dict_to_update.setdefault("summary", f"LLM Error: {str(e_llm_bucket)[:50]}")
+            bucket_dict_to_update.setdefault("category_id", "")
 
     def _write_time_bucket_summary(self):
-        """Write the current time bucket summary to a JSON file."""
-        bucket_file = (
-            self.focus_logs_dir / f"time_buckets_{self.session_start_tag}.json"
-        )
-        serializable = []
-        for idx in sorted(self.time_buckets.keys()):
-            b = self.time_buckets[idx]
-            serializable.append(
-                {
-                    "start": b["start"],
-                    "end": b["end"],
-                    "apps": sorted(b["apps"]),
-                    "titles": sorted(b["titles"]),
-                    "ocr_text": sorted(b["ocr_text"]),
-                    "summary": b.get("summary", ""),
-                }
-            )
+        """Write the current session's time bucket summaries to a JSON file."""
+        if not self.time_buckets:
+            logger.info("No time buckets to write for current session.")
+            return
+
+        # Filename includes the session start tag to differentiate sessions
+        bucket_file_path = self.focus_logs_dir / f"time_buckets_{self.session_start_tag}.json"
+        
+        serializable_buckets_list = []
+        for _bucket_idx in sorted(self.time_buckets.keys()): # Process in chronological order
+            bucket_content = self.time_buckets[_bucket_idx]
+            serializable_buckets_list.append({
+                "start": bucket_content["start"], 
+                "end": bucket_content["end"],
+                "apps": sorted(list(bucket_content.get("apps", set()))), # Convert sets to sorted lists
+                "titles": sorted(list(bucket_content.get("titles", set()))),
+                "ocr_text": sorted(list(bucket_content.get("ocr_text", set()))),
+                "summary": bucket_content.get("summary", ""),
+                "category_id": bucket_content.get("category_id", "")
+            })
 
         try:
-            with open(bucket_file, "w", encoding="utf-8") as f:
-                json.dump(serializable, f, indent=2)
-            logger.info(f"Wrote time bucket summary to {bucket_file}")
-        except Exception as e:
-            logger.error(f"Error writing bucket summary: {e}")
+            with open(bucket_file_path, "w", encoding="utf-8") as f:
+                json.dump(serializable_buckets_list, f, indent=2)
+            logger.info(f"Wrote {len(serializable_buckets_list)} time bucket summaries to {bucket_file_path}")
+        except Exception as e_write_bucket:
+            logger.error(f"Error writing time bucket summary file {bucket_file_path}: {e_write_bucket}")
 
-    def _generate_daily_summary(self, date_str=None):
-        """Generate a daily summary for the specified date or today."""
-        if date_str is None:
-            date_str = self.today
+    def _generate_daily_summary(self, date_to_summarize: Optional[str] = None):
+        """
+        Generate a daily summary.
+        If dashboard_utils are available, it uses them to create a base summary (which includes labeling),
+        then this agent enhances it with its own metrics (focus score, etc.) based on raw log data.
+        If dashboard_utils are not available, it creates a more basic summary itself.
+        The final, potentially enhanced, summary is saved to 'daily_summary_{date_str}.json'.
+        """
+        target_date_str = date_to_summarize if date_to_summarize else self.today
+        logger.info(f"Generating daily summary for {target_date_str}...")
 
-        logger.info(f"Generating daily summary file for {date_str}...")
-        summary_file = self.focus_logs_dir / f"daily_summary_{date_str}.json"
-        log_file = self.focus_logs_dir / f"focus_log_{date_str}.jsonl"
+        # Attempt to generate (or load if already generated by dashboard) the base summary
+        # generate_dashboard_summary_file (alias for data_utils.generate_summary_from_logs) now handles saving the file.
+        base_summary_dict = None
+        if DASHBOARD_UTILS_AVAILABLE:
+            logger.info(f"Using dashboard.data_utils to generate base summary for {target_date_str}")
+            base_summary_dict = generate_dashboard_summary_file(target_date_str) 
+        
+        if not base_summary_dict:
+            logger.warning(f"Base summary from dashboard_utils failed or unavailable for {target_date_str}.")
+            logger.info(f"Agent will attempt to create a summary from raw logs for {target_date_str} if they exist.")
+            # Minimal fallback if dashboard_utils didn't produce anything (e.g. no logs)
+            # This path should ideally not be hit if logs exist, as generate_dashboard_summary_file handles empty logs.
+            log_file_for_check = self.focus_logs_dir / f"focus_log_{target_date_str}.jsonl"
+            if not log_file_for_check.exists():
+                logger.error(f"No log file found at {log_file_for_check}. Cannot generate any summary for {target_date_str}.")
+                return None # Cannot proceed
+            # If logs exist but dashboard_utils failed severely, create a placeholder.
+            base_summary_dict = {"date": target_date_str, "totalTime": 0, "appBreakdown": []}
 
-        if not log_file.exists():
-            logger.warning(
-                f"No focus log file found for {date_str}. Cannot generate summary file."
-            )
-            return None  # Return None to indicate no data
+        # Work with a copy of the base_summary to enhance it
+        summary_to_enhance = base_summary_dict.copy()
 
-        summary = {  # Structure without screenshots/keywords
-            "date": date_str,
-            "totalTime": 0,
-            "appBreakdown": [],
-            "focusScore": 0,
-            "distractionEvents": 0,
-            "meetingTime": 0,
-            "productiveApps": [],
-            "distractionApps": [],
-        }
+        # --- Add/Overwrite Agent-Specific Metrics using RAW log data for agent's perspective ---
+        raw_log_file_path = self.focus_logs_dir / f"focus_log_{target_date_str}.jsonl"
+        if not raw_log_file_path.exists():
+            logger.warning(f"Raw log file {raw_log_file_path.name} missing. Cannot calculate agent-specific metrics. Using base summary as is.")
+            # The base_summary (potentially from dashboard_utils) is already saved by generate_dashboard_summary_file
+            return summary_to_enhance 
+
+        agent_perspective_log_entries: List[Dict[str, Any]] = []
         try:
-            log_entries = []
-            total_time = 0
-            app_time: Dict[str, float] = {}  # Now keyed by app_name (includes profile)
-            app_titles: Dict[str, Set[str]] = {}
-            app_exes: Dict[str, str] = {}  # Map app_name to exe for classification
-            app_ocr_texts: Dict[str, Set[str]] = {}
-            app_screens: Dict[str, Set[str]] = {}
-
-            # --- Process Log File ---
-            with open(log_file, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f, 1):
+            with open(raw_log_file_path, "r", encoding="utf-8") as f_raw:
+                for line in f_raw:
                     try:
                         entry = json.loads(line.strip())
-                        if not isinstance(entry, dict) or not all(
-                            k in entry
-                            for k in ["exe", "title", "duration", "timestamp"]
-                        ):
-                            continue
+                        # Basic validation for agent's needs
+                        if isinstance(entry, dict) and all(k in entry for k in ["exe", "title", "duration", "app_name"]):
+                            agent_perspective_log_entries.append(entry)
+                    except json.JSONDecodeError: continue # Skip malformed lines
+        except Exception as e_read_raw:
+            logger.error(f"Error reading raw log file {raw_log_file_path.name} for agent metrics: {e_read_raw}")
+            return summary_to_enhance # Return base summary if raw logs can't be read
 
-                        duration = entry.get("duration", 0)
-                        if duration <= 0:
-                            continue
+        if not agent_perspective_log_entries:
+            logger.info(f"No valid raw log entries in {raw_log_file_path.name} for agent-specific metrics. Using base summary.")
+            return summary_to_enhance
 
-                        # If entry doesn't have app_name (from older logs), generate it
-                        if "app_name" not in entry:
-                            app_identity, exe_path = self._get_app_identity(
-                                entry["exe"], entry["title"]
-                            )
-                            entry["app_name"] = app_identity
+        # Agent's calculation of distraction events (e.g., number of distinct activities or switches)
+        summary_to_enhance["distractionEvents"] = len(agent_perspective_log_entries) # Simplistic: count of all entries
 
-                        log_entries.append(entry)
-                        total_time += duration
+        # Agent's calculation of meeting time based on its own rules
+        summary_to_enhance["meetingTime"] = round(sum(
+            e["duration"] for e in agent_perspective_log_entries if self._is_meeting_app(e["exe"], e["title"])
+        ))
 
-                        # Use app_name as key (includes profile info)
-                        app_name = entry["app_name"]
-                        exe = entry["exe"]
-                        title = entry["title"] or ""
+        # Agent's classification of productive/distraction apps based on RAW data (its own rules)
+        agent_total_productive_time = 0.0
+        agent_total_distraction_time = 0.0
+        agent_classified_productive_apps = set()
+        agent_classified_distraction_apps = set()
 
-                        # Track time by app_name (with profile)
-                        app_time[app_name] = app_time.get(app_name, 0) + duration
+        # Aggregate raw exe/titles for agent's classification perspective
+        # Note: This uses the 'app_name' field directly from the raw log, which might include profile info.
+        # This is different from the dashboard's `apply_labels_to_logs` which creates `original_app_name`.
+        # For agent's classification, it makes sense to use what it logged as `app_name`.
+        raw_app_aggregates_for_agent: Dict[str, Dict[str, Any]] = {}
+        for entry in agent_perspective_log_entries:
+            # Use 'app_name' as logged by agent (which might be 'app_identity_name')
+            app_name_key = entry["app_name"] 
+            raw_app_aggregates_for_agent.setdefault(app_name_key, {"titles": set(), "duration": 0.0, "exe_path": entry["exe"]})
+            raw_app_aggregates_for_agent[app_name_key]["titles"].add(entry["title"])
+            raw_app_aggregates_for_agent[app_name_key]["duration"] += entry["duration"]
 
-                        # Track titles for each app_name
-                        if app_name not in app_titles:
-                            app_titles[app_name] = set()
-                            app_exes[app_name] = exe  # Store exe for classification
-                            app_ocr_texts[app_name] = set()
-                            app_screens[app_name] = set()
+        for app_name_key, details in raw_app_aggregates_for_agent.items():
+            titles_list = list(details["titles"])
+            exe_path_for_eval = details["exe_path"] 
+            duration_for_eval = details["duration"]
+            
+            if self._is_productive_app(exe_path_for_eval, titles_list):
+                agent_total_productive_time += duration_for_eval
+                agent_classified_productive_apps.add(app_name_key) 
+            elif self._is_distraction_app(exe_path_for_eval, titles_list):
+                agent_total_distraction_time += duration_for_eval
+                agent_classified_distraction_apps.add(app_name_key)
+        
+        summary_to_enhance["productiveApps"] = sorted(list(agent_classified_productive_apps))
+        summary_to_enhance["distractionApps"] = sorted(list(agent_classified_distraction_apps))
+        
+        # Use totalTime from the base_summary (which is sum of all durations from logs)
+        # If base_summary somehow missed totalTime, recalculate from agent_perspective_log_entries.
+        total_time_for_score_calc = summary_to_enhance.get("totalTime", sum(e["duration"] for e in agent_perspective_log_entries))
+        if total_time_for_score_calc == 0 and agent_perspective_log_entries: # Recalculate if base was 0 but we have entries
+            total_time_for_score_calc = sum(e["duration"] for e in agent_perspective_log_entries)
+            summary_to_enhance["totalTime"] = round(total_time_for_score_calc)
 
-                        if len(app_titles[app_name]) < 50:
-                            app_titles[app_name].add(title)
-
-                        ocr_val = entry.get("ocr_text")
-                        if ocr_val and len(app_ocr_texts[app_name]) < 50:
-                            app_ocr_texts[app_name].add(ocr_val)
-
-                        screen_val = entry.get("screenshot_path")
-                        if screen_val and len(app_screens[app_name]) < 50:
-                            app_screens[app_name].add(screen_val)
-                    except Exception as e:
-                        logger.error(f"Err processing line {line_num}: {e}")
-
-            summary["totalTime"] = round(total_time)
-            summary["distractionEvents"] = len(log_entries)
-
-            # App breakdown - now with browser profile support
-            app_breakdown_list = []
-            for app_name, time_spent in app_time.items():
-                exe = app_exes.get(app_name, "Unknown")
-                percentage = (time_spent / total_time * 100) if total_time > 0 else 0
-                app_breakdown_list.append(
-                    {
-                        "appName": app_name,  # Now includes profile info
-                        "exePath": exe,
-                        "timeSpent": round(time_spent),
-                        "percentage": round(percentage, 2),
-                        "windowTitles": sorted(list(app_titles.get(app_name, set()))),
-                        "ocrTexts": sorted(list(app_ocr_texts.get(app_name, set()))),
-                        "screenshotPaths": sorted(
-                            list(app_screens.get(app_name, set()))
-                        ),
-                    }
-                )
-            app_breakdown_list.sort(key=lambda x: x["timeSpent"], reverse=True)
-            summary["appBreakdown"] = app_breakdown_list
-
-            # Metrics
-            title_list_map = {
-                app["appName"]: app["windowTitles"] for app in app_breakdown_list
-            }
-            exe_map = {app["appName"]: app["exePath"] for app in app_breakdown_list}
-
-            # Meeting time calculation
-            summary["meetingTime"] = round(
-                sum(
-                    e["duration"]
-                    for e in log_entries
-                    if self._is_meeting_app(e["exe"], e["title"])
-                )
-            )
-
-            # App classification with profile support
-            productive_apps_set = {
-                app["appName"]
-                for app in app_breakdown_list
-                if self._is_productive_app(
-                    app["exePath"], title_list_map.get(app["appName"], [])
-                )
-            }
-
-            distraction_apps_set = {
-                app["appName"]
-                for app in app_breakdown_list
-                if self._is_distraction_app(
-                    app["exePath"], title_list_map.get(app["appName"], [])
-                )
-            }
-
-            summary["productiveApps"] = sorted(list(productive_apps_set))
-            summary["distractionApps"] = sorted(list(distraction_apps_set))
-            summary["focusScore"] = self._calculate_focus_score(
-                summary["productiveApps"],
-                summary["distractionApps"],
-                summary["appBreakdown"],
-                summary["totalTime"],
-            )
-
-            # Write summary file
-            with open(summary_file, "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2)
-            logger.info(f"Generated daily summary file for {date_str}.")
-
-            # Also create a live usage chart if matplotlib is available
-            try:
-                self._generate_usage_chart(summary, date_str)
-            except Exception as chart_err:
-                logger.warning(f"Could not generate usage chart: {chart_err}")
-
-            return summary
-
-        except Exception as e:
-            logger.error(
-                f"Error generating daily summary file for {date_str}: {e}",
-                exc_info=True,
-            )
-            return None
-
-    # --- Keep calculation helpers needed by _generate_daily_summary ---
-    def _calculate_focus_score(
-        self,
-        productive_apps: List[str],
-        distraction_apps: List[str],
-        app_breakdown: List[Dict],
-        total_time: int,
-    ) -> int:
-        if total_time <= 0:
-            return 0
-        productive_time = sum(
-            app["timeSpent"]
-            for app in app_breakdown
-            if app["appName"] in productive_apps
+        summary_to_enhance["focusScore"] = self._calculate_focus_score(
+            agent_total_productive_time, agent_total_distraction_time, total_time_for_score_calc
         )
-        distraction_time = sum(
-            app["timeSpent"]
-            for app in app_breakdown
-            if app["appName"] in distraction_apps
-        )
-        neutral_time = max(0, total_time - productive_time - distraction_time)
-        weighted_score = (
-            (productive_time * 1.0) + (neutral_time * 0.5) - (distraction_time * 1.0)
-        )
-        normalized_score = weighted_score / total_time if total_time > 0 else 0
-        final_score = max(0, min(100, int((normalized_score + 1) / 2 * 100)))
-        return final_score
+        
+        # Re-save the summary file, now enhanced with agent-specific metrics
+        # This overwrites the file saved by generate_dashboard_summary_file (if it ran)
+        final_summary_file_path = self.focus_logs_dir / f"daily_summary_{target_date_str}.json"
+        try:
+            with open(final_summary_file_path, "w", encoding="utf-8") as f_final_sum:
+                json.dump(summary_to_enhance, f_final_sum, indent=2)
+            logger.info(f"Agent-enhanced daily summary for {target_date_str} saved to {final_summary_file_path.name}")
+        except Exception as e_save_final:
+            logger.error(f"Error re-saving agent-enhanced daily summary {final_summary_file_path.name}: {e_save_final}")
+            # If save fails, the version from generate_dashboard_summary_file might still exist.
+            # Return what we have in memory.
+            return summary_to_enhance 
 
-    def _is_productive_app(self, exe_path: str, titles: List[str]) -> bool:
-        exe_lower = exe_path.lower()
-        title_concat_lower = " ".join(titles).lower()
-        if any(pe in exe_lower for pe in PRODUCTIVE_EXES):
-            if not any(dk in title_concat_lower for dk in DISTRACTION_TITLE_KEYWORDS):
+        # Optionally, generate a simple chart from the agent's perspective
+        try:
+            self._generate_agent_usage_chart(summary_to_enhance, target_date_str)
+        except Exception as chart_err:
+            logger.warning(f"Could not generate agent usage chart: {chart_err}")
+            
+        return summary_to_enhance
+
+    def _calculate_focus_score(self, productive_seconds: float, distraction_seconds: float, total_tracked_seconds: float) -> int:
+        """Calculate focus score based on productive, distraction, and total time."""
+        if total_tracked_seconds <= 0: return 0
+        
+        # Time not classified as productive or distraction is neutral
+        neutral_seconds = max(0, total_tracked_seconds - productive_seconds - distraction_seconds)
+        
+        # Weighted score: Productive=1, Neutral=0.5, Distraction=-1
+        weighted_score_val = (productive_seconds * 1.0) + (neutral_seconds * 0.5) - (distraction_seconds * 1.0)
+        
+        # Normalize score to be between -1 and 1 (relative to total time)
+        normalized_score_val = weighted_score_val / total_tracked_seconds if total_tracked_seconds > 0 else 0
+        
+        # Scale to 0-100 range
+        final_score_val = max(0, min(100, int((normalized_score_val + 1) / 2 * 100)))
+        return final_score_val
+
+    def _is_productive_app(self, exe_full_path: str, window_titles: List[str]) -> bool:
+        """Determine if app is productive based on agent's rules."""
+        exe_basename_lower = os.path.basename(exe_full_path).lower()
+        # Concatenate titles for keyword search, ensuring all are strings and lowercased
+        titles_concatenated_lower = " ".join(str(t).lower() for t in window_titles if t).strip()
+        
+        # Check if exe_basename_lower matches any in PRODUCTIVE_EXES
+        # PRODUCTIVE_EXES contains basenames, some with .exe, some without.
+        is_prod_exe = False
+        for prod_exe_pattern in PRODUCTIVE_EXES:
+            if prod_exe_pattern.endswith(".exe"):
+                if exe_basename_lower == prod_exe_pattern:
+                    is_prod_exe = True; break
+            else: # Pattern does not end with .exe, match against basename without extension
+                if exe_basename_lower.replace(".exe", "") == prod_exe_pattern:
+                    is_prod_exe = True; break
+        
+        if is_prod_exe:
+            # If it's a productive exe, ensure no distraction keywords are in titles
+            if not any(dist_keyword in titles_concatenated_lower for dist_keyword in DISTRACTION_TITLE_KEYWORDS if dist_keyword in titles_concatenated_lower):
                 return True
         return False
 
-    def _is_distraction_app(self, exe_path: str, titles: List[str]) -> bool:
-        exe_lower = exe_path.lower()
-        title_concat_lower = " ".join(titles).lower()
-        if any(de in exe_lower for de in DISTRACTION_EXES):
-            return True
-        if any(pe in exe_lower for pe in PRODUCTIVE_EXES) and any(
-            dk in title_concat_lower for dk in DISTRACTION_TITLE_KEYWORDS
-        ):
+    def _is_distraction_app(self, exe_full_path: str, window_titles: List[str]) -> bool:
+        """Determine if app is a distraction based on agent's rules."""
+        exe_basename_lower = os.path.basename(exe_full_path).lower()
+        titles_concatenated_lower = " ".join(str(t).lower() for t in window_titles if t).strip()
+
+        is_dist_exe = False
+        for dist_exe_pattern in DISTRACTION_EXES:
+            if dist_exe_pattern.endswith(".exe"):
+                if exe_basename_lower == dist_exe_pattern:
+                    is_dist_exe = True; break
+            else:
+                if exe_basename_lower.replace(".exe", "") == dist_exe_pattern:
+                    is_dist_exe = True; break
+        if is_dist_exe: return True
+        
+        # Check if a typically productive app is used for distraction (e.g., browser for YouTube)
+        is_potentially_prod_exe = False
+        for prod_exe_pattern in PRODUCTIVE_EXES:
+            if prod_exe_pattern.endswith(".exe"):
+                if exe_basename_lower == prod_exe_pattern: is_potentially_prod_exe = True; break
+            else:
+                if exe_basename_lower.replace(".exe", "") == prod_exe_pattern: is_potentially_prod_exe = True; break
+        
+        if is_potentially_prod_exe and any(dist_keyword in titles_concatenated_lower for dist_keyword in DISTRACTION_TITLE_KEYWORDS if dist_keyword in titles_concatenated_lower):
             return True
         return False
 
-    def _is_meeting_app(self, exe_path: str, title: str) -> bool:
-        exe_lower = exe_path.lower()
-        title_lower = title.lower()
-        if any(me in exe_lower for me in MEETING_EXES):
-            return True
-        if any(mk in title_lower for mk in MEETING_TITLE_KEYWORDS):
+    def _is_meeting_app(self, exe_full_path: str, window_title: str) -> bool:
+        """Determine if app is a meeting app based on agent's rules."""
+        exe_basename_lower = os.path.basename(exe_full_path).lower()
+        title_str_lower = str(window_title).lower() # Ensure title is string
+
+        is_meet_exe = False
+        for meet_exe_pattern in MEETING_EXES:
+            if meet_exe_pattern.endswith(".exe"):
+                if exe_basename_lower == meet_exe_pattern: is_meet_exe = True; break
+            else:
+                if exe_basename_lower.replace(".exe", "") == meet_exe_pattern: is_meet_exe = True; break
+        if is_meet_exe: return True
+        
+        if any(meet_keyword in title_str_lower for meet_keyword in MEETING_TITLE_KEYWORDS if meet_keyword in title_str_lower):
             return True
         return False
+    
+    def _generate_agent_usage_chart(self, summary_data_dict: Dict, date_str_for_chart: str):
+        """Generate a simple app usage pie chart using Matplotlib."""
+        # This method requires matplotlib. If not available, it should gracefully skip.
+        try:
+            import matplotlib.pyplot as plt
+            import pandas as pd # Matplotlib often used with pandas for data prep
+            MATPLOTLIB_AVAILABLE = True
+        except ImportError:
+            MATPLOTLIB_AVAILABLE = False
+            logger.info("Matplotlib not installed, skipping agent usage chart generation.")
+            return
 
-    # --- Main Agent Loop (Improved with regular summaries) ---
-    async def run_agent_loop(self, interval: int = 5):
-        """The main agent loop (async) - tracks focused window."""
-        logger.info(
-            f"Starting Focus Monitor agent loop (Window Tracking). Interval: {interval}s"
+        if not MATPLOTLIB_AVAILABLE: return # Double check
+
+        app_breakdown_list = summary_data_dict.get("appBreakdown", [])
+        if not app_breakdown_list:
+            logger.info(f"No app breakdown data to generate agent chart for {date_str_for_chart}.")
+            return
+
+        # Use pandas DataFrame for easier manipulation if complex filtering/sorting is needed
+        df_apps = pd.DataFrame(app_breakdown_list)
+        df_apps = df_apps.sort_values("timeSpent", ascending=False)
+        
+        # Prepare data for pie chart: Top N apps + "Other"
+        top_n_apps_for_chart = 10
+        if len(df_apps) > top_n_apps_for_chart:
+            df_top_apps = df_apps.head(top_n_apps_for_chart).copy() # Use .copy() to avoid SettingWithCopyWarning
+            other_apps_time = df_apps.iloc[top_n_apps_for_chart:]["timeSpent"].sum()
+            if other_apps_time > 0:
+                # Create a new row for 'Other Apps'
+                other_row = pd.DataFrame([{"appName": "Other Apps", "timeSpent": other_apps_time}])
+                df_top_apps = pd.concat([df_top_apps, other_row], ignore_index=True)
+        else:
+            df_top_apps = df_apps
+
+        if df_top_apps.empty or df_top_apps["timeSpent"].sum() == 0:
+             logger.info(f"Not enough data or zero total time for agent chart on {date_str_for_chart}")
+             return
+
+        plt.figure(figsize=(10, 8)) # Adjust figure size as needed
+        plt.pie(
+            df_top_apps["timeSpent"],
+            labels=df_top_apps["appName"],
+            autopct="%1.1f%%", # Format percentages
+            startangle=90, # Start first slice at the top
+            pctdistance=0.85 # Distance of percentage labels from center
         )
+        plt.title(f"App Usage (Agent View) - {date_str_for_chart}")
+        plt.axis("equal")  # Equal aspect ratio ensures that pie is drawn as a circle.
+        
+        chart_file_path = self.focus_logs_dir / f"agent_usage_chart_{date_str_for_chart}.png"
+        try:
+            plt.savefig(chart_file_path)
+            logger.info(f"Generated agent usage chart: {chart_file_path}")
+        except Exception as e_save_chart:
+            logger.error(f"Failed to save agent usage chart {chart_file_path}: {e_save_chart}")
+        finally:
+            plt.close() # Close the figure to free memory
+
+    async def run_agent_loop(self, check_interval_s: int = 5):
+        """The main agent loop: tracks focused window and manages summaries."""
+        logger.info(f"Starting Focus Monitor agent loop. Log check interval: {check_interval_s}s")
         self.window_start_time = time.time()
-        self.last_summary_time = time.time()
+        # Ensure summary runs on first suitable check if interval suggests it
+        self.last_summary_time = time.time() - self.summary_interval 
 
         while True:
-            main_loop_start_time = time.time()
+            loop_iteration_start_time = time.time()
             try:
                 # Check desired state from backend and toggle internal state if needed
-                self.toggle_active()
+                if self.api_url : self.toggle_active() # Only toggle if API is configured
 
-                # Skip window processing if not active, but still check for summary generation
-                if not self.active:
-                    # Check if it's time to generate a summary
-                    time_since_last_summary = time.time() - self.last_summary_time
-                    if time_since_last_summary >= self.summary_interval:
-                        self._generate_daily_summary()
-                        self._write_time_bucket_summary()
+                if not self.active: # If agent is paused
+                    # Still check if it's time to generate a daily summary for past activity
+                    if time.time() - self.last_summary_time >= self.summary_interval:
+                        # Before generating daily summary, finalize any active bucket
+                        if self.current_bucket_index is not None:
+                            self._finalize_bucket_summary(self.current_bucket_index)
+                        
+                        self._generate_daily_summary() # Will use self.today
+                        self._write_time_bucket_summary() # Write current session buckets
                         self.last_summary_time = time.time()
+                    
+                    # Sleep until next check, accounting for processing time
+                    await asyncio.sleep(max(0.1, check_interval_s - (time.time() - loop_iteration_start_time)))
+                    continue # Skip window processing if not active
 
-                    await asyncio.sleep(
-                        max(0.1, interval - (time.time() - main_loop_start_time))
-                    )
-                    continue
-
-                # Day Change Check (using UTC)
-                current_day_utc = self._get_current_utc_date()
-                if current_day_utc != self.today:
+                # --- Active Monitoring ---
+                # Day Change Check (using UTC date)
+                current_utc_date_str = self._get_current_utc_date()
+                if current_utc_date_str != self.today:
                     logger.info(
-                        f"Date changed from {self.today} to {current_day_utc}. Generating previous day summary."
+                        f"Date changed from {self.today} to {current_utc_date_str}. Processing previous day's data."
                     )
-                    self._generate_daily_summary(
-                        self.today
-                    )  # Generate final summary for previous day
-                    self._write_time_bucket_summary()
-                    self.today = current_day_utc
-                    logger.info(f"Updated current tracking date to {self.today}")
+                    # Finalize any active bucket before day change
+                    if self.current_bucket_index is not None:
+                        self._finalize_bucket_summary(self.current_bucket_index)
+                    
+                    self._generate_daily_summary(self.today) # Final summary for the day that just ended
+                    self._write_time_bucket_summary() # Write out buckets for the session that just ended with the day
+                    
+                    # Reset for the new day
+                    self.today = current_utc_date_str
+                    self.session_start_time = time.time() # New session starts now
+                    self.session_start_tag = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    self.time_buckets = {} # Clear buckets for the new session
+                    self.summarized_buckets = set() # Clear summarized buckets tracking
+                    self.current_bucket_index = None # Reset current bucket tracking
+                    self.last_window_info = None # Treat as fresh start for window tracking
+                    self.window_start_time = time.time()
+                    logger.info(f"Updated current tracking date to {self.today}. New session tag: {self.session_start_tag}")
 
                 # Get current focused window details
-                current_window_info = self._get_focused_window_details()
+                current_focused_win_details = self._get_focused_window_details()
 
                 # Determine if the focused window changed significantly
-                is_idle = current_window_info is None
-                window_changed = False
-                if is_idle:
-                    if self.last_window_info is not None:
-                        window_changed = True  # Active -> Idle
+                is_now_idle = current_focused_win_details is None
+                window_has_changed = False
+                if is_now_idle:
+                    if self.last_window_info is not None: window_has_changed = True # Transition: Active -> Idle
                 elif self.last_window_info is None:
-                    window_changed = True  # Idle -> Active
-                elif (
-                    current_window_info["hwnd"] != self.last_window_info["hwnd"]
-                    or current_window_info["title"] != self.last_window_info["title"]
-                    or current_window_info["exe"] != self.last_window_info["exe"]
-                ):
-                    window_changed = True  # Active -> Different Active
+                    window_has_changed = True # Transition: Idle -> Active
+                # Active -> Different Active: Compare key attributes
+                elif (current_focused_win_details["hwnd"] != self.last_window_info.get("hwnd") or \
+                      current_focused_win_details["title"] != self.last_window_info.get("title") or \
+                      current_focused_win_details["exe"] != self.last_window_info.get("exe") or \
+                      current_focused_win_details["app_name_identity"] != self.last_window_info.get("app_name_identity")):
+                    window_has_changed = True
 
-                if window_changed:
-                    # Log duration for the *previous* window/state
+                if window_has_changed:
+                    # Log duration for the *previous* window/state if it existed
                     if self.last_window_info:
-                        duration = int(time.time() - self.window_start_time)
-                        if duration > 0:
-                            self._log_window_activity(self.last_window_info, duration)
+                        duration_active = int(time.time() - self.window_start_time)
+                        if duration_active > 0:
+                            self._log_window_activity(self.last_window_info, duration_active)
 
                     # Reset timer and update last window info (becomes None if now idle)
                     self.window_start_time = time.time()
-                    self.last_window_info = current_window_info
+                    self.last_window_info = current_focused_win_details # Update to current, or None if idle
 
-                # Check if it's time to generate a summary
-                time_since_last_summary = time.time() - self.last_summary_time
-                if time_since_last_summary >= self.summary_interval:
-                    self._generate_daily_summary()
-                    self._write_time_bucket_summary()
+                # Check if it's time to generate a periodic daily summary and write buckets
+                if time.time() - self.last_summary_time >= self.summary_interval:
+                    # Before generating daily summary, finalize any active bucket
+                    if self.current_bucket_index is not None:
+                        self._finalize_bucket_summary(self.current_bucket_index)
+                    
+                    self._generate_daily_summary() # Uses self.today
+                    self._write_time_bucket_summary() # Writes current session's buckets
                     self.last_summary_time = time.time()
 
-                # Sleep until next interval
-                elapsed = time.time() - main_loop_start_time
-                sleep_duration = max(0.1, interval - elapsed)
+                # Sleep until next interval, accounting for processing time in this iteration
+                elapsed_this_iteration = time.time() - loop_iteration_start_time
+                sleep_duration = max(0.1, check_interval_s - elapsed_this_iteration) # Ensure positive sleep
                 await asyncio.sleep(sleep_duration)
 
             except KeyboardInterrupt:
-                logger.info("KeyboardInterrupt received in agent loop.")
-                break
-            except Exception as e:
-                logger.error(f"Unhandled error in agent loop: {e}", exc_info=True)
-                await asyncio.sleep(interval * 2)  # Wait longer after error
+                logger.info("KeyboardInterrupt received in agent loop. Exiting.")
+                break # Exit the while loop
+            except Exception as e_loop: # Catch-all for unexpected errors in the loop
+                logger.error(f"Unhandled error in agent loop: {e_loop}", exc_info=True)
+                await asyncio.sleep(check_interval_s * 2) # Wait longer after an error before retrying
 
-        # --- Cleanup on exit ---
+        # --- Cleanup on loop exit (e.g., due to KeyboardInterrupt) ---
         logger.info("Agent loop finished. Performing final cleanup...")
-        if self.last_window_info:  # Log final activity
-            duration = int(time.time() - self.window_start_time)
-            if duration > 0:
-                self._log_window_activity(self.last_window_info, duration)
+        
+        # Finalize any remaining active bucket before final cleanup
+        if self.current_bucket_index is not None:
+            self._finalize_bucket_summary(self.current_bucket_index)
+            
+        if self.last_window_info:  # Log any final pending activity
+            duration_final = int(time.time() - self.window_start_time)
+            if duration_final > 0:
+                self._log_window_activity(self.last_window_info, duration_final)
+        
         self._generate_daily_summary()  # Generate final summary for the last active day
-        self._write_time_bucket_summary()
+        self._write_time_bucket_summary() # Write out any remaining buckets for the session
         logger.info("Focus Monitor agent stopped.")
 
 
-async def main_async():
-    parser = argparse.ArgumentParser(
-        description="Focus Monitor Agent (Window Tracking)"
-    )
-    parser.add_argument(
-        "--output-dir",
-        "-o",
-        help="Optional directory to store logs (defaults to script directory)",
-    )
-    parser.add_argument(
-        "--api-url", "-a", help="Backend API URL for status checks (optional)"
-    )
-    parser.add_argument(
-        "--interval", "-i", type=int, default=5, help="Sampling interval in seconds"
-    )
-    parser.add_argument(
-        "--summary-interval",
-        "-s",
-        type=int,
-        default=300,
-        help="Interval for generating summaries (seconds)",
-    )
-    parser.add_argument(
-        "--no-api-check",
-        action="store_true",
-        help="Disable checking backend API for status.",
-    )
-    parser.add_argument(
-        "--force-summary",
-        action="store_true",
-        help="Force generate a summary immediately on start",
-    )
+async def main_async_entrypoint():
+    """Parses arguments and starts the FocusMonitorAgent."""
+    parser = argparse.ArgumentParser(description="Focus Monitor Agent (Window Tracking)")
+    parser.add_argument("--output-dir", "-o", type=str, default=None,
+                        help="Optional directory to store logs (defaults to script directory).")
+    parser.add_argument("--api-url", "-a", type=str, default=None,
+                        help="Backend API URL for status checks (optional).")
+    parser.add_argument("--interval", "-i", type=int, default=5,
+                        help="Sampling interval in seconds for checking focused window (default: 5s).")
+    parser.add_argument("--summary-interval", "-s", type=int, default=300,
+                        help="Interval for generating periodic summaries in seconds (default: 300s = 5min).")
+    parser.add_argument("--no-api-check", action="store_true",
+                        help="Disable checking backend API for active status (agent runs continuously).")
+    parser.add_argument("--force-summary-on-start", action="store_true",
+                        help="Force generate a daily summary immediately on start for the current day.")
+    parser.add_argument("--tesseract-path", type=str, default=None,
+                        help="Explicitly set the path to tesseract.exe (e.g., for Windows if not in PATH).")
     args = parser.parse_args()
 
-    # If output directory is specified, verify it exists
-    if args.output_dir:
-        output_dir_path = Path(args.output_dir)
-        if not output_dir_path.is_dir():
-            logger.critical(f"Output directory not found: {args.output_dir}")
+    # Configure Tesseract path if provided (especially for Windows)
+    if args.tesseract_path and OCR_AVAILABLE:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = args.tesseract_path
+            logger.info(f"Tesseract command path set to: {args.tesseract_path}")
+        except Exception as e_tess_path:
+            logger.error(f"Failed to set Tesseract command path to '{args.tesseract_path}': {e_tess_path}")
+
+
+    output_directory_path = Path(args.output_dir) if args.output_dir else SCRIPT_DIR # Use SCRIPT_DIR if None
+    if args.output_dir and not output_directory_path.is_dir(): # Check only if specified
+        logger.critical(f"Specified output directory not found: {args.output_dir}")
+        try: # Attempt to create it
+            output_directory_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created output directory: {output_directory_path}")
+        except Exception as e_mkdir:
+            logger.critical(f"Failed to create output directory {output_directory_path}: {e_mkdir}")
             sys.exit(1)
-    else:
-        output_dir_path = None  # Will default to script directory
+    
+    api_url_for_agent = None if args.no_api_check else args.api_url
 
-    api_url = None if args.no_api_check else args.api_url
-
-    agent = FocusMonitorAgent(output_dir_path, api_url)
-    agent.summary_interval = args.summary_interval
+    # Instantiate and configure the agent
+    agent_instance = FocusMonitorAgent(str(output_directory_path), api_url_for_agent)
+    agent_instance.summary_interval = args.summary_interval
 
     # Generate a summary immediately if requested
-    if args.force_summary:
-        agent._generate_daily_summary()
-        agent._write_time_bucket_summary()
-        agent.last_summary_time = time.time()
+    if args.force_summary_on_start:
+        logger.info("Forcing initial daily summary generation as per --force-summary-on-start...")
+        agent_instance._generate_daily_summary() # For current day (self.today)
+        agent_instance._write_time_bucket_summary() # Write any buckets from very short startup
+        agent_instance.last_summary_time = time.time() # Reset summary timer
 
-    tasks = [asyncio.create_task(agent.run_agent_loop(args.interval))]
-    if api_url:
-        tasks.append(asyncio.create_task(agent.check_backend_status()))
+    # Create tasks for the agent loop and backend status check (if API is used)
+    agent_tasks = [asyncio.create_task(agent_instance.run_agent_loop(args.interval))]
+    if api_url_for_agent: # Only run status check if API URL is provided
+        agent_tasks.append(asyncio.create_task(agent_instance.check_backend_status()))
 
     try:
-        await tasks[0]  # Wait for main loop
+        # Wait for the main agent loop to complete (or be cancelled)
+        await agent_tasks[0] 
     except asyncio.CancelledError:
-        logger.info("Agent loop task cancelled.")
-    finally:  # Cleanup background tasks
-        for task in tasks[1:]:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks[1:], return_exceptions=True)
-        logger.info("All background tasks finished.")
+        logger.info("Main agent loop task was cancelled.")
+    finally:
+        # Ensure all background tasks (like API checker) are cancelled and awaited
+        for task_to_cancel in agent_tasks[1:]: # Cancel any other tasks
+            if not task_to_cancel.done():
+                task_to_cancel.cancel()
+        # Await their completion (or cancellation exception)
+        if len(agent_tasks) > 1:
+            await asyncio.gather(*agent_tasks[1:], return_exceptions=True)
+        logger.info("All agent background tasks have been processed.")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_async())
+        asyncio.run(main_async_entrypoint())
     except KeyboardInterrupt:
-        logger.info("Focus Monitor stopped by user (main).")
-    except Exception as main_err:
-        logger.critical(f"Focus Monitor exited: {main_err}", exc_info=True)
+        logger.info("Focus Monitor Agent stopped by user (Ctrl+C in main).")
+    except Exception as main_execution_err:
+        logger.critical(f"Focus Monitor Agent exited due to an unhandled error in main: {main_execution_err}", exc_info=True)
+    finally:
+        logger.info("Focus Monitor Agent application shutting down.")

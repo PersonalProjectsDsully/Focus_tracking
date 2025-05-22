@@ -1,3 +1,5 @@
+import streamlit as st
+st.session_state['streamlit_running'] = True
 import json
 import os
 import re
@@ -12,348 +14,189 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import psutil
-import streamlit as st
 
+
+# Import all utility functions from dashboard modules
 from dashboard.data_utils import (
     load_available_dates, load_log_entries, load_daily_summary, generate_summary_from_logs,
     load_labels, save_labels, apply_labels_to_logs, group_activities_for_labeling,
     load_block_feedback, save_block_feedback, load_time_buckets_for_date,
     update_bucket_summary_in_file, load_categories, save_categories,
     update_bucket_category_in_file, generate_time_buckets_from_logs,
+    LOGS_DIR, LABELS_FILE, FEEDBACK_FILE, CATEGORIES_FILE
 )
 from dashboard.llm_utils import (
     _call_llm_api, generate_summary_and_category, generate_summary_from_raw_with_llm,
-    refine_summary_with_llm, process_activity_data,
+    refine_summary_with_llm, get_available_ollama_models, 
+    get_available_openai_models, test_llm_connection, DEFAULT_LLM_API_URL, DEFAULT_LLM_MODEL, 
+    DEFAULT_OPENAI_MODEL, get_openai_models_from_api
+) # Removed process_activity_data import
+from dashboard.charts import (
+    create_pie_chart, create_browser_chart, create_category_chart
 )
-from dashboard.charts import create_pie_chart, create_browser_chart, create_category_chart
-# --- Configuration ---
 
 # --- Tracker Control Functions ---
 def is_tracker_running():
     pid = st.session_state.get("tracker_pid")
-    if pid is None:
+    if pid is None: return False
+    try:
+        return psutil.pid_exists(pid) and "standalone_focus_monitor.py" in " ".join(psutil.Process(pid).cmdline())
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
-    return psutil.pid_exists(pid)
-
-
+    
 def start_tracker():
     if is_tracker_running():
         st.info("Focus tracker already running.")
         return
-    script = str(Path(__file__).parent / "standalone_focus_monitor.py")
+    # Ensure script path is robust
+    script_path = Path(__file__).resolve().parent / "standalone_focus_monitor.py"
+    if not script_path.exists():
+        st.error(f"Tracker script not found at {script_path}")
+        # Try to find it in the current working directory as a fallback for some execution contexts
+        script_path_cwd = Path.cwd() / "standalone_focus_monitor.py"
+        if not script_path_cwd.exists():
+            st.error(f"Also not found at {script_path_cwd}")
+            return
+        script_path = script_path_cwd
+        
     try:
-        process = subprocess.Popen([sys.executable, script])
+        # Start detached if possible, or manage process carefully
+        process = subprocess.Popen([sys.executable, str(script_path)])
         st.session_state["tracker_pid"] = process.pid
-        st.success("Focus tracker started")
+        st.success(f"Focus tracker started (PID: {process.pid})")
+        time.sleep(1) # Give it a moment to stabilize
     except Exception as e:
         st.error(f"Failed to start tracker: {e}")
 
 
 def stop_tracker():
     pid = st.session_state.get("tracker_pid")
-    if not pid or not psutil.pid_exists(pid):
-        st.info("Focus tracker is not running.")
+    if not pid or not is_tracker_running(): # Use is_tracker_running for robust check
+        st.info("Focus tracker is not running or PID is stale.")
         st.session_state["tracker_pid"] = None
         return
     try:
         p = psutil.Process(pid)
-        p.terminate()
-        p.wait(timeout=5)  # Give it a moment to terminate
-        st.success("Focus tracker stopped")
+        p.terminate() # SIGTERM
+        p.wait(timeout=5) 
+        st.success("Focus tracker stop signal sent.")
     except psutil.NoSuchProcess:
         st.info("Focus tracker process not found (already stopped?).")
+    except psutil.TimeoutExpired:
+        st.warning("Tracker did not terminate gracefully, attempting to kill.")
+        try:
+            p.kill() # SIGKILL
+            p.wait(timeout=2)
+            st.success("Focus tracker killed.")
+        except Exception as e_kill:
+            st.error(f"Failed to kill tracker: {e_kill}")
     except Exception as e:
         st.error(f"Failed to stop tracker: {e}")
     finally:
         st.session_state["tracker_pid"] = None
 
 
-def llm_test_page():
-    """A dedicated page for testing LLM category suggestions"""
-    st.title("🧪 LLM Category Suggestion Test Tool")
+def display_retroactive_processor():
+    st.title("⏮️ Historical Data Processor")
+    dates = load_available_dates()
+    if not dates: st.error("No data found in focus_logs directory."); st.stop()
+    
+    selected_date = st.selectbox("Select a date to process", dates, key="processor_date_select")
+    if not selected_date: st.info("Please select a date."); st.stop()
 
-    # Check if categories exist
+    log_file = LOGS_DIR / f"focus_log_{selected_date}.jsonl"
+    summary_file = LOGS_DIR / f"daily_summary_{selected_date}.json"
+    # For time buckets, the filename might vary. We check if ANY buckets exist for the date.
+    existing_buckets_for_date = load_time_buckets_for_date(selected_date)
+    
+    st.subheader("Available Data Status")
+    col1, col2 = st.columns(2)
+    col1.metric("Focus Log File", "✅ Found" if log_file.exists() else "❌ Missing")
+    col1.metric("Daily Summary File", "✅ Found" if summary_file.exists() else "❌ Missing")
+    col2.metric("Time Buckets for Date", f"{len(existing_buckets_for_date)} found" if existing_buckets_for_date else "❌ None Found")
+
+    st.subheader("Processing Actions")
+    if st.button("🔄 (Re)Generate Daily Summary from Logs", key="proc_gen_summary_btn", help="Parses raw logs, applies labels, and creates/overwrites the daily summary file."):
+        with st.spinner("Generating daily summary..."):
+            summary_data = generate_summary_from_logs(selected_date) # This now saves the file
+            if summary_data: st.success(f"Daily summary for {selected_date} processed."); st.json(summary_data, expanded=False)
+            else: st.error("Failed to process daily summary.")
+            st.rerun()
+
+    if st.button("🔄 (Re)Generate 5-Min Time Buckets & LLM Summaries", key="proc_gen_buckets_btn", help="Divides logs into 5-min chunks, calls LLM for summaries/categories, and saves a new time_buckets_*.json file."):
+        with st.spinner("Generating time buckets and LLM summaries... This can take time."):
+            success = generate_time_buckets_from_logs(selected_date) # This now saves the file
+            if success: st.success(f"Time buckets for {selected_date} processed.")
+            else: st.error("Failed to process time buckets.")
+            st.rerun() # Rerun to refresh bucket count and sample display
+            
+    if existing_buckets_for_date:
+        st.subheader("Sample of Existing Time Buckets (Max 5 Shown)")
+        categories_map = {cat.get("id"): cat.get("name", "Unknown") for cat in load_categories()}
+        for i, bucket in enumerate(existing_buckets_for_date[:5]):
+            start_dt = pd.to_datetime(bucket.get("start")).strftime("%H:%M")
+            end_dt = pd.to_datetime(bucket.get("end")).strftime("%H:%M")
+            cat_name = categories_map.get(bucket.get("category_id", ""), "Uncategorized")
+            with st.expander(f"Bucket {start_dt}-{end_dt} [{cat_name}] (Session: {bucket.get('session_tag', 'N/A')})"):
+                st.write("**LLM Summary:**", bucket.get("summary", "_N/A_"))
+                st.caption(f"Titles: {len(bucket.get('titles',[]))}, OCR: {len(bucket.get('ocr_text',[]))}")
+
+
+def llm_test_page():
+    st.title("🧪 LLM Processing Test Tool")
     categories = load_categories()
     if not categories:
-        st.error("No categories have been defined. Please create categories first.")
-        st.info("Go to the Activity Categories Manager tab to create categories.")
-        return
+        st.error("No categories defined. Please create them in 'Activity Categories Manager'."); return
 
-    st.write(
-        "This tool helps diagnose issues with category suggestions by directly testing the LLM's responses."
-    )
-
-    # Display current categories
+    st.write("Test LLM summarization and categorization with custom inputs.")
     with st.expander("View Current Categories"):
-        for cat in categories:
-            st.write(
-                f"**{cat.get('name')}** ({cat.get('id')}): {cat.get('description')}"
+        for cat in categories: st.write(f"**{cat.get('name')}** ({cat.get('id')}): {cat.get('description')}")
+
+    st.subheader("Test Input")
+    test_titles_str = st.text_area("Window Titles (one per line):", height=100, placeholder="VS Code - my_project.py\nChrome - Google Search")
+    test_ocr_str = st.text_area("OCR Text Snippets (one per line, optional):", placeholder="Important text from screen...")
+
+    
+    test_titles = [t.strip() for t in test_titles_str.split("\n") if t.strip()]
+    test_ocr = [o.strip() for o in test_ocr_str.split("\n") if o.strip()]
+
+    allow_suggestions_test = st.checkbox("Allow LLM to suggest new categories", True)
+
+    if (test_titles or test_ocr) and st.button("🚀 Run LLM Test", type="primary"):
+        with st.spinner("Querying LLM..."):
+            # Use the refactored llm_utils function, requesting the prompt back
+            summary, cat_id, suggestion, gen_prompt = generate_summary_from_raw_with_llm(
+                test_titles, test_ocr, allow_suggestions=allow_suggestions_test, return_prompt=True
             )
-
-    # Input area for test data
-    st.subheader("Test Data")
-    test_method = st.radio(
-        "Choose test method",
-        ["Sample Titles", "Custom Titles", "Raw Log Data"],
-        help="Select how you want to provide test data",
-    )
-
-    test_titles = []
-
-    if test_method == "Sample Titles":
-        st.write("Using sample titles:")
-        sample_options = [
-            "Programming sample (VS Code, GitHub)",
-            "Meeting sample (Zoom, Calendar)",
-            "Web browsing sample (Chrome, browsing)",
-            "Gaming sample (Steam, game windows)",
-        ]
-        selected_sample = st.selectbox("Select a sample dataset", sample_options)
-
-        if selected_sample == "Programming sample (VS Code, GitHub)":
-            test_titles = [
-                "VS Code - focus_monitor.py",
-                "GitHub - Issues - Focus Tracking",
-                "Stack Overflow - Python multithreading question",
-            ]
-        elif selected_sample == "Meeting sample (Zoom, Calendar)":
-            test_titles = [
-                "Zoom Meeting - Weekly Planning",
-                "Google Calendar - Meeting Schedule",
-                "Slack - #team-updates channel",
-            ]
-        elif selected_sample == "Web browsing sample (Chrome, browsing)":
-            test_titles = [
-                "Chrome - Reddit - r/programming",
-                "Chrome - YouTube - Python Tutorial",
-                "Chrome - Amazon - Shopping Cart",
-            ]
-        elif selected_sample == "Gaming sample (Steam, game windows)":
-            test_titles = [
-                "Steam - Library",
-                "EscapeFromTarkov",
-                "Discord - Gaming Server",
-            ]
-
-        st.write("Window titles:")
-        for title in test_titles:
-            st.write(f"- {title}")
-
-    elif test_method == "Custom Titles":
-        custom_titles = st.text_area(
-            "Enter window titles (one per line)",
-            placeholder="VS Code - my_project.py\nChrome - Google Search\nSlack - #general",
-        )
-        if custom_titles:
-            test_titles = [t.strip() for t in custom_titles.split("\n") if t.strip()]
-
-    elif test_method == "Raw Log Data":
-        # Load available dates
-        available_dates = load_available_dates()
-        if not available_dates:
-            st.error("No log data found.")
-            return
-
-        selected_date = st.selectbox("Select date", available_dates)
-        logs_df = load_log_entries(selected_date)
-
-        if logs_df.empty:
-            st.error(f"No log entries found for {selected_date}")
-            return
-
-        if "title" not in logs_df.columns:
-            st.error("Log data doesn't contain window title information")
-            return
-
-        # Show sample of log data
-        st.write("Sample of log data:")
-        st.dataframe(logs_df[["title", "app_name"]].head(10))
-
-        # Get unique titles
-        unique_titles = logs_df["title"].dropna().unique().tolist()
-        test_titles = unique_titles[:10]  # Use first 10 unique titles
-
-        st.write(f"Using {len(test_titles)} unique window titles from the logs")
-
-    # Test button
-    if test_titles and st.button("Test LLM Category Suggestion", type="primary"):
-        with st.spinner("Sending request to LLM... This may take a few moments."):
-            # Generate the prompt
-            prompt_text = "Please provide a concise summary of computer activity based on the following window titles and detected text fragments. Focus on the primary tasks or topics.\n\n"
-            prompt_text += (
-                "Window Titles:\n"
-                + "\n".join([f'- "{t}"' for t in test_titles])
-                + "\n\n"
-            )
-
-            prompt_text += "Based on the activity, please categorize it into ONE of the following categories:\n\n"
-            for cat in categories:
-                prompt_text += (
-                    f"- {cat.get('name')} ({cat.get('id')}): {cat.get('description')}\n"
-                )
-
-            prompt_text += "\nIf none of these categories fit well, you can suggest a new category instead."
-            prompt_text += "\n\nFirst, provide a concise summary of the activity."
-            prompt_text += "\nThen, on a new line after 'CATEGORY:', provide ONLY the category ID that best matches the activity, or 'none' if no categories fit well."
-            prompt_text += "\nIf you answered 'none', then on a new line after 'SUGGESTION:', provide a suggested new category name and short description in the format 'name | description'."
-
-            # Show the full prompt
-            with st.expander("View full prompt sent to LLM"):
-                st.code(prompt_text)
-
-            # Call LLM API
-            llm_response = _call_llm_api(prompt_text, "test category suggestion")
-
-            # Display raw response
-            st.subheader("Raw LLM Response")
-            st.code(llm_response)
-
-            # Process response
-            st.subheader("Processed Response")
-
-            # Parse the response
-            try:
-                parts = llm_response.split("CATEGORY:")
-                if len(parts) < 2:
-                    st.error("❌ LLM did not include 'CATEGORY:' tag in response.")
-                    st.warning(
-                        "The LLM should respond with a summary followed by 'CATEGORY:' tag."
-                    )
-                    return
-
-                summary_text = parts[0].strip()
-                category_text = parts[1].strip()
-
-                st.write("**Summary:**")
-                st.info(summary_text)
-
-                # Get category ID (first word after CATEGORY:)
-                category_id = category_text.split()[0] if category_text.split() else ""
-
-                # Check for suggestions
-                suggested_category = ""
-                if "SUGGESTION:" in category_text:
-                    suggestion_parts = category_text.split("SUGGESTION:")
-                    if len(suggestion_parts) > 1:
-                        category_text = suggestion_parts[0].strip()
-                        suggested_category = suggestion_parts[1].strip()
-
-                        # Update category_id
-                        category_id = (
-                            category_text.split()[0] if category_text.split() else ""
-                        )
-
-                # Check if the category is "none"
-                if category_id.lower() == "none":
-                    st.write(
-                        "**Category:** None (LLM suggests creating a new category)"
-                    )
-                    category_id = ""
-                else:
-                    # Verify if category ID exists
-                    valid_cat_ids = [cat.get("id", "") for cat in categories]
-                    if category_id in valid_cat_ids:
-                        cat_name = next(
-                            (
-                                cat.get("name", "Unknown")
-                                for cat in categories
-                                if cat.get("id") == category_id
-                            ),
-                            "Unknown",
-                        )
-                        st.write(f"**Category:** {cat_name} ({category_id})")
-                        st.success("✅ Category ID is valid")
-                    else:
-                        st.error(f"❌ Invalid Category ID: '{category_id}'")
-                        st.warning(
-                            "The category ID doesn't match any existing categories."
-                        )
-
-                # Display suggestion if present
-                if suggested_category:
-                    st.write("**Suggested New Category:**")
-
-                    # Check format
-                    if "|" in suggested_category:
-                        name, desc = suggested_category.split("|", 1)
-                        st.info(f"Name: {name.strip()}")
-                        st.info(f"Description: {desc.strip()}")
-                        st.success(
-                            "✅ Suggestion format is correct (contains name | description)"
-                        )
-
-                        # Show how it would be added
-                        suggested_id = name.strip().lower().replace(" ", "_")
-                        st.write("Would be added as:")
-                        st.code(
-                            f"""{{
-  "id": "{suggested_id}",
-  "name": "{name.strip()}",
-  "description": "{desc.strip()}"
-}}""",
-                            language="json",
-                        )
-
-                        # Option to add it
-                        if st.button("Add This Category Now"):
-                            # Create the new category
-                            new_category = {
-                                "id": suggested_id,
-                                "name": name.strip(),
-                                "description": desc.strip(),
-                            }
-
-                            # Check if ID already exists
-                            existing_ids = [cat.get("id", "") for cat in categories]
-                            if suggested_id in existing_ids:
-                                st.error(
-                                    f"A category with ID '{suggested_id}' already exists."
-                                )
-                            else:
-                                # Add it to categories
-                                categories.append(new_category)
-                                if save_categories(categories):
-                                    st.success(
-                                        f"Created new category '{name.strip()}'!"
-                                    )
-                                    time.sleep(1)
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to save the new category.")
-                    else:
-                        st.warning(
-                            "⚠️ Suggestion format is incorrect (missing '|' separator)"
-                        )
-                        st.info(f"Raw suggestion: {suggested_category}")
-
-            except Exception as e:
-                st.error(f"Error processing LLM response: {e}")
-                st.info(
-                    "This indicates a problem with the response format or parsing logic."
-                )
-
-    # Help section
-    with st.expander("Troubleshooting Tips"):
-        st.write(
-            """
-        ### Troubleshooting LLM Category Suggestions
         
-        If category suggestions aren't working correctly:
+        st.subheader("LLM Interaction Details")
+        if gen_prompt:
+            with st.expander("Full Prompt Sent to LLM"): st.code(gen_prompt, language='text')
         
-        1. **Check response format**: The LLM should respond with:
-           - A summary text
-           - A "CATEGORY:" tag followed by a category ID or "none"
-           - A "SUGGESTION:" tag (if "none" was given) with a new category name and description
+        # For raw response, ideally _call_llm_api would be called directly or its response passed through.
+        # Here, we reconstruct what the LLM *should* have output if it followed the format.
+        st.subheader("LLM's Parsed Output:")
+        st.markdown(f"**Generated Summary:**")
+        st.info(summary or "_No summary returned or parsed._")
         
-        2. **Verify category IDs**: Make sure the LLM is using the exact category IDs you defined
-        
-        3. **Format issues**: The suggestion should use the format "name | description"
-        
-        4. **API connection**: Ensure your LLM API (Ollama) is running and accessible
-        
-        5. **Prompt clarity**: The prompt should clearly explain the format requirements
-        """
-        )
+        st.markdown(f"**Identified Category ID:**")
+        if cat_id:
+            cat_name = next((c.get("name") for c in categories if c.get("id") == cat_id), f"Unknown ID: {cat_id}")
+            st.success(f"{cat_name} ({cat_id})")
+        elif allow_suggestions_test and not cat_id and suggestion: # Implies 'none' was chosen
+             st.warning("None (LLM suggests a new category below)")
+        else:
+            st.warning("_No valid category ID identified._")
+
+        if allow_suggestions_test and suggestion:
+            st.markdown(f"**Suggested New Category:**")
+            if "|" in suggestion:
+                sugg_name, sugg_desc = suggestion.split("|", 1)
+                st.success(f"Name: `{sugg_name.strip()}` | Description: `{sugg_desc.strip()}`")
+            else:
+                st.error(f"Suggestion format error. Raw: `{suggestion}` (Expected 'name | description')")
+        elif allow_suggestions_test:
+            st.markdown("**Suggested New Category:** _None_")
 
 
 # --- Data Management Functions ---
@@ -474,522 +317,123 @@ def display_category_manager():
                         time.sleep(1)
                         st.rerun()
 
-
-def save_current_bucket():
-    global current_bucket, buckets, bucket_start_time
-
-    if current_bucket["titles"] or current_bucket["ocr_text"]:
-        # Set the end time for the bucket
-        current_bucket["end"] = datetime.now().isoformat()
-
-        # Generate summary and category with simplified function
-        summary_text, category_id = generate_summary_and_category(current_bucket)
-
-        # Add summary and category to bucket
-        if summary_text:
-            current_bucket["summary"] = summary_text
-        if category_id:
-            current_bucket["category_id"] = category_id
-
-        # Add to list of buckets
-        buckets.append(current_bucket)
-
-        # Save buckets to file
-        save_buckets_to_file()
-
-    # Reset for next bucket
-    bucket_start_time = datetime.now()
-    current_bucket = {
-        "start": bucket_start_time.isoformat(),
-        "titles": [],
-        "ocr_text": [],
-    }
-
-
 # --- Time Bucket Summaries Page ---
 def display_time_bucket_summaries():
     st.title("📝 5-Minute Summaries & Feedback")
     dates = load_available_dates()
-    if not dates:
-        st.error("No data found in focus_logs directory.")
-        st.stop()
+    if not dates: st.error("No data in focus_logs directory."); st.stop()
     selected_date = st.selectbox("Select a date", dates, key="summaries_date_select")
 
-    official_buckets = load_time_buckets_for_date(selected_date)
+    official_buckets = load_time_buckets_for_date(selected_date) # Returns list of dicts with 'session_tag'
     personal_notes_data = load_block_feedback()
-    categories = load_categories()  # Load categories
+    categories = load_categories()
+    cat_map = {cat.get("id"): cat for cat in categories}
 
     if not official_buckets:
-        st.info(f"No 5-minute summary blocks found for {selected_date}.")
-        return
+        st.info(f"No 5-minute summary blocks found for {selected_date}."); return
 
-    # Add tab for uncategorized entries
-    show_uncategorized = st.checkbox("Show only uncategorized entries", value=False)
+    show_uncategorized_only = st.checkbox("Filter: Show only uncategorized entries", False)
+    
+    # Category filter (if not showing only uncategorized)
+    active_category_filter = "All Categories"
+    if categories and not show_uncategorized_only:
+        cat_options = ["All Categories", "Uncategorized"] + [cat.get("name") for cat in categories]
+        active_category_filter = st.selectbox("Filter by category", cat_options, key="sum_cat_filter")
 
-    # Create category filter if categories exist
-    category_filter = "All Categories"
-    if categories and not show_uncategorized:
-        category_options = ["All Categories", "Uncategorized"] + [
-            cat.get("name", "Unknown") for cat in categories
-        ]
-        category_filter = st.selectbox(
-            "Filter by category", category_options, key="category_filter"
-        )
-
-    # Count buckets by category
+    # Bucket counts by category
     if categories:
-        cat_counts = {"Uncategorized": 0}
-        for cat in categories:
-            cat_counts[cat.get("name", "Unknown")] = 0
-
-        for bucket in official_buckets:
-            cat_id = bucket.get("category_id", "")
-            if cat_id:
-                cat_name = next(
-                    (
-                        cat.get("name", "Unknown")
-                        for cat in categories
-                        if cat.get("id") == cat_id
-                    ),
-                    "Uncategorized",
-                )
-                cat_counts[cat_name] = cat_counts.get(cat_name, 0) + 1
-            else:
-                cat_counts["Uncategorized"] = cat_counts.get("Uncategorized", 0) + 1
-
-        # Display category counts
+        counts = {"Uncategorized": 0, **{cat.get("name"): 0 for cat in categories}}
+        for b in official_buckets:
+            cat_name = cat_map.get(b.get("category_id"), {}).get("name", "Uncategorized")
+            counts[cat_name] = counts.get(cat_name, 0) + 1
         st.subheader("Summary Blocks by Category")
-        cols = st.columns(len(cat_counts))
-        for i, (cat_name, count) in enumerate(cat_counts.items()):
-            cols[i].metric(cat_name, count)
-
-        # Show warning if there are uncategorized entries
-        if cat_counts["Uncategorized"] > 0:
-            st.warning(
-                f"You have {cat_counts['Uncategorized']} uncategorized entries. Use the checkbox above to focus on them."
-            )
-
+        cols = st.columns(min(len(counts), 5)) # Max 5 columns for metrics
+        for i, (name, count) in enumerate(counts.items()):
+            if count > 0: cols[i % 5].metric(name, count)
+        if counts["Uncategorized"] > 0:
+             st.warning(f"{counts['Uncategorized']} entries are uncategorized. Use filter above.")
         st.markdown("---")
 
-    for idx, bucket_data in enumerate(official_buckets):
-        bucket_start_iso = bucket_data["start"]
-        session_tag = bucket_data.get("session_tag", "unknown_session")
 
-        start_dt = pd.to_datetime(bucket_start_iso)
-        end_dt = pd.to_datetime(bucket_data.get("end", bucket_start_iso))
-        time_range_display = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} (UTC {start_dt.strftime('%Y-%m-%d')})"
+    for idx, bucket in enumerate(official_buckets):
+        bucket_start_iso = bucket["start"]
+        session_tag = bucket.get("session_tag", "unknown_session") # Crucial for targeting correct file
+        current_cat_id = bucket.get("category_id", "")
+        current_cat_name = cat_map.get(current_cat_id, {}).get("name", "Uncategorized")
 
-        current_official_summary_text = bucket_data.get("summary", "")
-        current_personal_note_text = personal_notes_data.get(bucket_start_iso, "")
-        current_category_id = bucket_data.get("category_id", "")
+        if show_uncategorized_only and current_cat_id: continue
+        if not show_uncategorized_only and active_category_filter != "All Categories":
+            if active_category_filter == "Uncategorized" and current_cat_name != "Uncategorized": continue
+            if active_category_filter != "Uncategorized" and current_cat_name != active_category_filter: continue
+        
+        start_dt_fmt = pd.to_datetime(bucket_start_iso).strftime('%H:%M')
+        exp_title = f"{start_dt_fmt} (Session: {session_tag}) - [{current_cat_name}]"
+        if not current_cat_id: exp_title += " ⚠️"
 
-        # Find current category name from ID
-        current_category_name = "Uncategorized"
-        if current_category_id:
-            cat_match = next(
-                (
-                    cat.get("name", "Unknown")
-                    for cat in categories
-                    if cat.get("id") == current_category_id
-                ),
-                "Uncategorized",
-            )
-            current_category_name = cat_match
-
-        # Apply category filter and uncategorized filter
-        if show_uncategorized:
-            if current_category_id:  # Skip categorized entries
-                continue
-        elif category_filter != "All Categories":
-            if (
-                category_filter == "Uncategorized"
-                and current_category_name != "Uncategorized"
-            ):
-                continue
-            elif (
-                category_filter != "Uncategorized"
-                and current_category_name != category_filter
-            ):
-                continue
-
-        # Add category to expander title
-        expander_title = f"{time_range_display}"
-        if categories:
-            expander_title += f" - [{current_category_name}]"
-            if not current_category_id:
-                expander_title += " ⚠️"  # Add warning icon for uncategorized
-
-        with st.expander(expander_title):
-            # Display category selection if categories exist
+        with st.expander(exp_title):
+            # Category selection
             if categories:
-                st.markdown("**Current Category:**")
+                st.markdown("**Activity Category:**")
+                cat_names_options = ["Uncategorized"] + [c.get("name") for c in categories]
+                cat_ids_options = [""] + [c.get("id") for c in categories]
+                try: current_sel_idx = cat_ids_options.index(current_cat_id)
+                except ValueError: current_sel_idx = 0 # Default to Uncategorized
 
-                # Show suggestion UI if uncategorized
-                suggested_category_name = ""
-                suggested_category_desc = ""
+                new_cat_name_sel = st.selectbox("Set Category:", cat_names_options, index=current_sel_idx, key=f"cat_sel_{idx}_{bucket_start_iso}")
+                new_cat_id_sel = cat_ids_options[cat_names_options.index(new_cat_name_sel)]
 
-                if not current_category_id:
-                    raw_titles = bucket_data.get("titles", [])
-                    raw_ocr = bucket_data.get("ocr_text", [])
+                if new_cat_id_sel != current_cat_id:
+                    if st.button("Update Category", key=f"upd_cat_btn_{idx}_{bucket_start_iso}"):
+                        if update_bucket_category_in_file(session_tag, bucket_start_iso, new_cat_id_sel):
+                            st.success("Category updated!"); time.sleep(1); st.rerun()
+            
+            st.markdown("**Official LLM Summary:**")
+            st.caption(bucket.get("summary", "_No official summary._"))
 
-                    # Button to get suggestion
-                    if st.button(
-                        "Get Category Suggestion",
-                        key=f"suggest_cat_btn_{idx}_{bucket_start_iso}",
-                    ):
-                        with st.spinner("Asking LLM for category suggestion..."):
-                            _, _, suggestion = generate_summary_from_raw_with_llm(
-                                raw_titles, raw_ocr
-                            )
-                            if suggestion:
-                                try:
-                                    suggestion_parts = suggestion.split("|", 1)
-                                    suggested_category_name = suggestion_parts[
-                                        0
-                                    ].strip()
-                                    suggested_category_desc = (
-                                        suggestion_parts[1].strip()
-                                        if len(suggestion_parts) > 1
-                                        else ""
-                                    )
-                                    st.session_state[
-                                        f"suggested_cat_name_{idx}_{bucket_start_iso}"
-                                    ] = suggested_category_name
-                                    st.session_state[
-                                        f"suggested_cat_desc_{idx}_{bucket_start_iso}"
-                                    ] = suggested_category_desc
-                                except:
-                                    st.error("Couldn't parse the suggestion properly.")
+            # LLM Actions: Refine, Re-Generate
+            st.markdown("**LLM Summary Actions (Modifies Log File):**")
+            llm_action_cols = st.columns(2)
+            user_feedback_for_refine = st.text_area("Your feedback/details for LLM refinement:", key=f"feedback_llm_{idx}_{bucket_start_iso}", height=75)
 
-                # Display suggestion if available
-                suggestion_key_name = f"suggested_cat_name_{idx}_{bucket_start_iso}"
-                suggestion_key_desc = f"suggested_cat_desc_{idx}_{bucket_start_iso}"
+            if llm_action_cols[0].button("Refine LLM Summary", key=f"refine_btn_{idx}_{bucket_start_iso}"):
+                if user_feedback_for_refine.strip():
+                    with st.spinner("Refining summary with LLM..."):
+                        # Adjusted to ignore the 4th return value (prompt)
+                        refined_sum, new_cid, sugg_cat, _ = refine_summary_with_llm(
+                            bucket.get("summary",""), user_feedback_for_refine, current_cat_id, True)
+                        if refined_sum is not None:
+                            update_bucket_summary_in_file(session_tag, bucket_start_iso, refined_sum)
+                            if new_cid != current_cat_id : update_bucket_category_in_file(session_tag, bucket_start_iso, new_cid)
+                            # Handle sugg_cat display or auto-creation logic if desired
+                            st.success("Summary refined!"); time.sleep(1); st.rerun()
+                        else: st.error("LLM refinement failed.")
+                else: st.warning("Provide feedback text to refine.")
 
-                if (
-                    suggestion_key_name in st.session_state
-                    and st.session_state[suggestion_key_name]
-                ):
-                    suggested_category_name = st.session_state[suggestion_key_name]
-                    suggested_category_desc = st.session_state.get(
-                        suggestion_key_desc, ""
-                    )
-
-                    st.info(
-                        f"**Suggested New Category:** {suggested_category_name}\n\n{suggested_category_desc}"
-                    )
-
-                    # Add buttons to create this category and apply it
-                    col1, col2 = st.columns(2)
-
-                    if col1.button(
-                        "Create & Apply This Category",
-                        key=f"create_apply_cat_btn_{idx}_{bucket_start_iso}",
-                    ):
-                        # Generate a valid ID from the name
-                        suggested_id = suggested_category_name.lower().replace(" ", "_")
-
-                        # Check if this ID already exists
-                        existing_ids = [cat.get("id", "") for cat in categories]
-                        if suggested_id in existing_ids:
-                            st.error(
-                                f"A category with ID '{suggested_id}' already exists. Please edit it manually."
-                            )
-                        else:
-                            # Create the new category
-                            new_category = {
-                                "id": suggested_id,
-                                "name": suggested_category_name,
-                                "description": suggested_category_desc,
-                            }
-
-                            # Add it to categories
-                            categories.append(new_category)
-                            if save_categories(categories):
-                                # Apply the new category to this bucket
-                                if update_bucket_category_in_file(
-                                    session_tag, bucket_start_iso, suggested_id
-                                ):
-                                    st.success(
-                                        f"Created new category '{suggested_category_name}' and applied it!"
-                                    )
-                                    time.sleep(1)
-                                    st.rerun()
-                                else:
-                                    st.error(
-                                        "Failed to apply the new category to this bucket."
-                                    )
-                            else:
-                                st.error("Failed to save the new category.")
-
-                    if col2.button(
-                        "Discard Suggestion",
-                        key=f"discard_suggestion_btn_{idx}_{bucket_start_iso}",
-                    ):
-                        # Clear suggestion from session state
-                        if suggestion_key_name in st.session_state:
-                            del st.session_state[suggestion_key_name]
-                        if suggestion_key_desc in st.session_state:
-                            del st.session_state[suggestion_key_desc]
-                        st.success("Suggestion discarded.")
-                        time.sleep(0.5)
-                        st.rerun()
-
-                # Standard category selection
-                category_options = ["Uncategorized"] + [
-                    cat.get("name", "Unknown") for cat in categories
-                ]
-                category_ids = [""] + [cat.get("id", "") for cat in categories]
-
-                # Find index of current category in the options
-                selected_cat_index = 0  # Default to "Uncategorized"
-                if current_category_id:
-                    try:
-                        selected_cat_index = category_ids.index(current_category_id)
-                    except ValueError:
-                        pass  # Keep default if not found
-
-                selected_category = st.selectbox(
-                    "Select category for this activity block",
-                    options=category_options,
-                    index=selected_cat_index,
-                    key=f"category_select_{idx}_{bucket_start_iso}",
-                )
-
-                # Get the ID for the selected category name
-                selected_cat_id = ""
-                if selected_category != "Uncategorized":
-                    selected_cat_index = category_options.index(selected_category)
-                    if selected_cat_index > 0:  # Skip "Uncategorized"
-                        selected_cat_id = category_ids[
-                            selected_cat_index - 1
-                        ]  # Adjust index for the offset
-
-                # Update category if changed
-                if selected_cat_id != current_category_id:
-                    if st.button(
-                        "Update Category",
-                        key=f"update_cat_btn_{idx}_{bucket_start_iso}",
-                    ):
-                        if update_bucket_category_in_file(
-                            session_tag, bucket_start_iso, selected_cat_id
-                        ):
-                            st.success(f"Category updated to '{selected_category}'")
-                            time.sleep(1)
-                            st.rerun()
-
-            # Show the rest of the bucket details (summary, notes, actions)
-            st.markdown("**Current Official Summary (from log file):**")
-            st.caption(
-                current_official_summary_text
-                or "_No official summary available for this block._"
-            )
-
-            st.markdown("**Your Input Text:**")
-            user_input_text = st.text_area(
-                "Use this text area to: (1) Save a personal note, (2) Provide feedback for the LLM to refine the summary, or (3) Write your own summary to replace the current one.",
-                value=current_personal_note_text,
-                key=f"user_text_area_{idx}_{bucket_start_iso}",
-                height=100,
-            )
-
-            # --- Personal Note Actions ---
-            st.markdown("---")
-            st.write("**Manage Personal Note (Saved Separately):**")
+            if llm_action_cols[1].button("Re-Generate Original LLM Summary", key=f"regen_btn_{idx}_{bucket_start_iso}"):
+                with st.spinner("Re-generating summary with LLM..."):
+                     # Adjusted to ignore the 4th return value (prompt)
+                    new_sum, new_cid, sugg_cat, _ = generate_summary_from_raw_with_llm(
+                        bucket.get("titles",[]), bucket.get("ocr_text",[]), True)
+                    if new_sum is not None:
+                        update_bucket_summary_in_file(session_tag, bucket_start_iso, new_sum)
+                        if new_cid : update_bucket_category_in_file(session_tag, bucket_start_iso, new_cid)
+                        st.success("Summary re-generated!"); time.sleep(1); st.rerun()
+                    else: st.error("LLM re-generation failed.")
+            
+            # Personal Notes
+            st.markdown("**Personal Note (Private):**")
+            personal_note_key = f"note_{idx}_{bucket_start_iso}"
+            current_personal_note = personal_notes_data.get(bucket_start_iso, "")
+            new_personal_note = st.text_area("Your private note for this block:", value=current_personal_note, key=personal_note_key, height=75)
+            
             note_cols = st.columns(2)
-            if note_cols[0].button(
-                "Save Input as Personal Note",
-                key=f"save_personal_note_{idx}_{bucket_start_iso}",
-                help="Saves the text in the 'Your Input Text' area above as a private note for this block. This does NOT change the Official Summary.",
-            ):
-                personal_notes_data[bucket_start_iso] = user_input_text.strip()
-                if save_block_feedback(personal_notes_data):
-                    st.success("Personal note saved!")
-                else:
-                    st.error("Failed to save personal note.")
+            if note_cols[0].button("Save Personal Note", key=f"save_note_{idx}_{bucket_start_iso}"):
+                personal_notes_data[bucket_start_iso] = new_personal_note.strip()
+                if save_block_feedback(personal_notes_data): st.success("Personal note saved!"); time.sleep(0.5); st.rerun()
+            if current_personal_note and note_cols[1].button("Delete Personal Note", key=f"del_note_{idx}_{bucket_start_iso}"):
+                if bucket_start_iso in personal_notes_data: del personal_notes_data[bucket_start_iso]
+                if save_block_feedback(personal_notes_data): st.success("Personal note deleted!"); time.sleep(0.5); st.rerun()
 
-            if note_cols[1].button(
-                "Delete Personal Note",
-                key=f"delete_personal_note_{idx}_{bucket_start_iso}",
-                help="Deletes the private note associated with this block.",
-            ):
-                if bucket_start_iso in personal_notes_data:
-                    del personal_notes_data[bucket_start_iso]
-                    if save_block_feedback(personal_notes_data):
-                        st.success("Personal note deleted!")
-                        time.sleep(0.5)
-                        st.rerun()
-                    else:
-                        st.error("Failed to delete personal note.")
-                else:
-                    st.info("No personal note to delete for this block.")
-
-            # --- Official Summary Actions (Modifies time_buckets_*.json) ---
-            st.markdown("---")
-            st.write("**Manage Official Summary (Modifies Log File):**")
-            official_summary_action_cols = st.columns(3)
-
-            with official_summary_action_cols[0]:
-                if st.button(
-                    "Set as Official Summary",
-                    key=f"set_official_summary_from_input_{idx}_{bucket_start_iso}",
-                    help="Replaces the 'Current Official Summary' above with the text from the 'Your Input Text' area. This directly modifies the summary in the log file.",
-                ):
-                    if user_input_text.strip():
-                        if update_bucket_summary_in_file(
-                            session_tag, bucket_start_iso, user_input_text.strip()
-                        ):
-                            st.success("Official summary updated with your input!")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(
-                                "Failed to update official summary with your input."
-                            )
-                    else:
-                        st.warning(
-                            "Text area is empty. Please enter text to set as the official summary."
-                        )
-
-            with official_summary_action_cols[1]:
-                if st.button(
-                    "Refine LLM Summary",
-                    key=f"refine_llm_summary_btn_{idx}_{bucket_start_iso}",
-                    help="Uses the 'Current Official Summary' AND the text from 'Your Input Text' (as feedback) to ask the LLM to generate an improved summary. This new summary will replace the current one in the log file.",
-                ):
-                    if user_input_text.strip():
-                        (
-                            refined_summary_text,
-                            refined_category_id,
-                            suggested_category,
-                        ) = refine_summary_with_llm(
-                            current_official_summary_text,
-                            user_input_text.strip(),
-                            current_category_id,
-                        )
-                        if refined_summary_text is not None:
-                            # Update summary
-                            if update_bucket_summary_in_file(
-                                session_tag, bucket_start_iso, refined_summary_text
-                            ):
-                                # Update category if it changed
-                                category_updated = False
-                                if refined_category_id != current_category_id:
-                                    category_updated = update_bucket_category_in_file(
-                                        session_tag,
-                                        bucket_start_iso,
-                                        refined_category_id,
-                                    )
-
-                                # Store suggestion if provided
-                                if suggested_category:
-                                    try:
-                                        suggestion_parts = suggested_category.split(
-                                            "|", 1
-                                        )
-                                        suggested_category_name = suggestion_parts[
-                                            0
-                                        ].strip()
-                                        suggested_category_desc = (
-                                            suggestion_parts[1].strip()
-                                            if len(suggestion_parts) > 1
-                                            else ""
-                                        )
-                                        st.session_state[
-                                            f"suggested_cat_name_{idx}_{bucket_start_iso}"
-                                        ] = suggested_category_name
-                                        st.session_state[
-                                            f"suggested_cat_desc_{idx}_{bucket_start_iso}"
-                                        ] = suggested_category_desc
-                                    except:
-                                        pass  # Ignore parsing errors for suggestions
-
-                                success_msg = "LLM summary refined and updated!"
-                                if category_updated:
-                                    success_msg += " Category was also updated."
-                                if suggested_category:
-                                    success_msg += " A new category was suggested."
-
-                                st.success(success_msg)
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.error("Failed to save LLM-refined official summary.")
-                    else:
-                        st.warning(
-                            "Please enter some feedback in the 'Your Input Text' area to help refine the summary."
-                        )
-
-            with official_summary_action_cols[2]:
-                if st.button(
-                    "Re-Generate Original LLM Summary",
-                    key=f"regenerate_original_llm_summary_btn_{idx}_{bucket_start_iso}",
-                    help="Asks the LLM to create a brand new summary based on the raw window titles and OCR text recorded for this block. This will replace the 'Current Official Summary' in the log file.",
-                ):
-                    raw_titles_list = bucket_data.get("titles", [])
-                    raw_ocr_list = bucket_data.get("ocr_text", [])
-                    (
-                        regenerated_summary_text,
-                        regenerated_category_id,
-                        suggested_category,
-                    ) = generate_summary_from_raw_with_llm(
-                        raw_titles_list, raw_ocr_list
-                    )
-                    if regenerated_summary_text is not None:
-                        # Update summary
-                        if update_bucket_summary_in_file(
-                            session_tag, bucket_start_iso, regenerated_summary_text
-                        ):
-                            # Update category
-                            category_updated = False
-                            if regenerated_category_id:
-                                category_updated = update_bucket_category_in_file(
-                                    session_tag,
-                                    bucket_start_iso,
-                                    regenerated_category_id,
-                                )
-
-                            # Store suggestion if provided
-                            if suggested_category:
-                                try:
-                                    suggestion_parts = suggested_category.split("|", 1)
-                                    suggested_category_name = suggestion_parts[
-                                        0
-                                    ].strip()
-                                    suggested_category_desc = (
-                                        suggestion_parts[1].strip()
-                                        if len(suggestion_parts) > 1
-                                        else ""
-                                    )
-                                    st.session_state[
-                                        f"suggested_cat_name_{idx}_{bucket_start_iso}"
-                                    ] = suggested_category_name
-                                    st.session_state[
-                                        f"suggested_cat_desc_{idx}_{bucket_start_iso}"
-                                    ] = suggested_category_desc
-                                except:
-                                    pass  # Ignore parsing errors for suggestions
-
-                            success_msg = (
-                                "Original LLM summary re-generated and updated!"
-                            )
-                            if category_updated:
-                                success_msg += " Category was also updated."
-                            if suggested_category:
-                                success_msg += " A new category was suggested."
-
-                            st.success(success_msg)
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(
-                                "Failed to save LLM re-generated official summary."
-                            )
-
-    # Display notice if all items are filtered out
-    if show_uncategorized and all(
-        bucket.get("category_id", "") for bucket in official_buckets
-    ):
-        st.info("All entries for this date have been categorized! 🎉")
 
 
 # --- Label Editor Page ---
@@ -1242,46 +686,60 @@ def display_label_editor():
                     st.rerun()
         else:
             st.info("No specific title labels to delete.")
-    # ... (similar deletion UI for exact_exe and patterns) ...
+    with del_ltab2:
+        keys_to_del = list(current_labels.get("exact_exe", {}).keys())
+        if keys_to_del:
+            sel_key = st.selectbox(
+                "Select Application Label to Delete",
+                keys_to_del,
+                format_func=lambda k: f"{k} -> {current_labels['exact_exe'][k]}",
+                key="del_sel_exact_exe",
+            )
+            if st.button("Delete Selected App Label", key="del_btn_exact_exe"):
+                if sel_key in current_labels["exact_exe"]:
+                    del current_labels["exact_exe"][sel_key]
+                if save_labels(current_labels):
+                    st.success("Label deleted.")
+                    time.sleep(1)
+                    st.rerun()
+        else:
+            st.info("No application labels to delete.")
+    with del_ltab3:
+        keys_to_del = list(current_labels.get("patterns", {}).keys())
+        if keys_to_del:
+            sel_key = st.selectbox(
+                "Select Pattern Label to Delete",
+                keys_to_del,
+                format_func=lambda k: f"{k.split('::')[1]} - '{k.split('::')[2]}' -> {current_labels['patterns'][k]}",
+                key="del_sel_pattern",
+            )
+            if st.button("Delete Selected Pattern Label", key="del_btn_pattern"):
+                if sel_key in current_labels["patterns"]:
+                    del current_labels["patterns"][sel_key]
+                if save_labels(current_labels):
+                    st.success("Label deleted.")
+                    time.sleep(1)
+                    st.rerun()
+        else:
+            st.info("No pattern labels to delete.")
 
     st.subheader("Preview With Labels Applied")
     if not logs_df_for_labeling.empty:
-        labeled_logs_preview = apply_labels_to_logs(
-            logs_df_for_labeling.copy()
-        )  # Important: use a copy
-        if (
-            not labeled_logs_preview.empty
-            and "app_name" in labeled_logs_preview.columns
-        ):
+        labeled_logs_preview = apply_labels_to_logs(logs_df_for_labeling.copy())
+        if not labeled_logs_preview.empty and "app_name" in labeled_logs_preview.columns:
             preview_agg = (
                 labeled_logs_preview.groupby("app_name")
                 .agg(
                     total_duration_sec=("duration", "sum"),
-                    original_names=(
-                        "original_app_name",
-                        lambda x: list(set(x))[:3],
-                    ),  # Show a few original names
-                    log_entries=(
-                        ("timestamp", "count")
-                        if "timestamp" in labeled_logs_preview
-                        else ("duration", "count")
-                    ),
+                    original_names=("original_app_name", lambda x: list(set(x))[:3]),
+                    log_entries=("timestamp", "count") if "timestamp" in labeled_logs_preview else ("duration", "count"),
                 )
                 .reset_index()
                 .sort_values("total_duration_sec", ascending=False)
             )
-            preview_agg["Total Duration (min)"] = (
-                preview_agg["total_duration_sec"] / 60
-            ).round(1)
+            preview_agg["Total Duration (min)"] = (preview_agg["total_duration_sec"] / 60).round(1)
             st.dataframe(
-                preview_agg[
-                    [
-                        "app_name",
-                        "Total Duration (min)",
-                        "log_entries",
-                        "original_names",
-                    ]
-                ],
+                preview_agg[["app_name", "Total Duration (min)", "log_entries", "original_names"]],
                 use_container_width=True,
             )
             if not preview_agg.empty and preview_agg["total_duration_sec"].sum() > 0:
@@ -1382,9 +840,7 @@ def display_dashboard():
         "Select a date to view", available_dates, key="dashboard_date_select"
     )
 
-    daily_summary_data = load_daily_summary(
-        selected_date
-    )  # This now applies labels via generate_summary_from_logs
+    daily_summary_data = load_daily_summary(selected_date)
     if not daily_summary_data:
         st.warning(f"Could not load or generate a summary for {selected_date}.")
         st.stop()
@@ -1402,7 +858,7 @@ def display_dashboard():
     if categories and all_buckets:
         st.subheader("🏆 Activity by Category")
 
-        # Create category chart
+        # Create category chart using the imported function
         fig_category = create_category_chart(all_buckets, categories)
         if fig_category:
             st.plotly_chart(fig_category, use_container_width=True)
@@ -1479,6 +935,7 @@ def display_dashboard():
     st.subheader("🧠 Time Distribution by Application/Activity (Post-Labeling)")
     app_breakdown_data = daily_summary_data.get("appBreakdown", [])
     if app_breakdown_data:
+        # Use the charts module function
         fig_pie_main = create_pie_chart(app_breakdown_data)
         st.plotly_chart(fig_pie_main, use_container_width=True)
 
@@ -1497,7 +954,8 @@ def display_dashboard():
         st.info("No application usage data available for this date in the summary.")
 
     st.subheader("🌐 Browser Usage Analysis (Labeled)")
-    fig_browser_main = create_browser_chart(app_breakdown_data)  # Uses labeled appName
+    # Use the charts module function
+    fig_browser_main = create_browser_chart(app_breakdown_data)
     if fig_browser_main:
         st.plotly_chart(fig_browser_main, use_container_width=True)
     else:
@@ -1599,45 +1057,239 @@ def display_dashboard():
     )
 
 
+# --- Control Panel Sidebar ---
+def display_control_panel():
+    st.sidebar.title("Focus Monitor Controls")
+    
+    # Tracker control
+    st.sidebar.subheader("Tracker Status")
+    if is_tracker_running():
+        st.sidebar.success("✅ Focus Tracker Running")
+        if st.sidebar.button("Stop Tracker"):
+            stop_tracker()
+            st.rerun()
+    else:
+        st.sidebar.warning("❌ Focus Tracker Not Running")
+        if st.sidebar.button("Start Tracker"):
+            start_tracker()
+            st.rerun()
+    
+    # LLM Provider Selection
+    st.sidebar.subheader("LLM Provider Settings")
+    
+    # Initialize session state defaults if not set
+    if "llm_provider" not in st.session_state:
+        st.session_state.llm_provider = "ollama"
+    if "ollama_api_url" not in st.session_state:
+        st.session_state.ollama_api_url = DEFAULT_LLM_API_URL
+    if "ollama_model" not in st.session_state:
+        st.session_state.ollama_model = DEFAULT_LLM_MODEL
+    if "openai_model" not in st.session_state:
+        st.session_state.openai_model = DEFAULT_OPENAI_MODEL
+    if "openai_models_fetched" not in st.session_state:
+        st.session_state.openai_models_fetched = False
+    if "available_openai_models" not in st.session_state:
+        st.session_state.available_openai_models = get_available_openai_models()  # Default models
+    if "ollama_models_fetched" not in st.session_state:
+        st.session_state.ollama_models_fetched = False
+    if "available_ollama_models" not in st.session_state:
+        st.session_state.available_ollama_models = []
+    if "ollama_model_display_info" not in st.session_state:
+        st.session_state.ollama_model_display_info = {}
+    
+    # LLM provider selection
+    provider_options = ["ollama", "openai"]
+    selected_provider = st.sidebar.radio(
+        "Select LLM Provider", 
+        provider_options,
+        index=provider_options.index(st.session_state.llm_provider),
+        help="Choose between local Ollama models or OpenAI API",
+        horizontal=True
+    )
+    
+    # Update session state if changed
+    if selected_provider != st.session_state.llm_provider:
+        st.session_state.llm_provider = selected_provider
+        st.rerun()
+    
+    # Provider-specific settings
+    if selected_provider == "ollama":
+        # Ollama settings
+        ollama_api_url = st.sidebar.text_input(
+            "Ollama API URL",
+            value=st.session_state.ollama_api_url,
+            help="URL of the Ollama API server (default: http://localhost:11434/api/generate)"
+        )
+        
+        # Update API URL in session state if changed
+        api_url_changed = False
+        if ollama_api_url != st.session_state.ollama_api_url:
+            st.session_state.ollama_api_url = ollama_api_url
+            api_url_changed = True
+            # Reset models_fetched flag when URL changes
+            st.session_state.ollama_models_fetched = False
+        
+        # Fetch models if not fetched yet or URL changed
+        if not st.session_state.ollama_models_fetched or api_url_changed:
+            with st.sidebar.status("Fetching Ollama models..."):
+                model_names, model_display_info = get_available_ollama_models(ollama_api_url)
+                st.session_state.available_ollama_models = model_names
+                st.session_state.ollama_model_display_info = model_display_info
+                st.session_state.ollama_models_fetched = True
+            
+            # Set default model if current one isn't available
+            if (st.session_state.ollama_model not in model_names and model_names):
+                st.session_state.ollama_model = model_names[0]
+        
+        # Model selection with format display names
+        if st.session_state.available_ollama_models:
+            # Create formatted model display names
+            format_model_name = lambda model: (
+                f"{model} - {st.session_state.ollama_model_display_info[model]}" 
+                if model in st.session_state.ollama_model_display_info 
+                else model
+            )
+            
+            formatted_model_names = [
+                format_model_name(model) for model in st.session_state.available_ollama_models
+            ]
+            
+            # Find index of current model
+            current_index = 0
+            for i, model_name in enumerate(st.session_state.available_ollama_models):
+                if model_name == st.session_state.ollama_model:
+                    current_index = i
+                    break
+            
+            # Display the dropdown with formatted names
+            selected_formatted_model = st.sidebar.selectbox(
+                "Ollama Model",
+                options=formatted_model_names,
+                index=current_index,
+                help="Select an Ollama model to use for summaries and categorization"
+            )
+            
+            # Extract the actual model name from the formatted name
+            selected_model = selected_formatted_model.split(" - ")[0] if " - " in selected_formatted_model else selected_formatted_model
+            
+            # Update model if changed
+            if selected_model != st.session_state.ollama_model:
+                st.session_state.ollama_model = selected_model
+        else:
+            st.sidebar.warning("No Ollama models found. Is Ollama running?")
+        
+        # Button to manually refresh models
+        if st.sidebar.button("Refresh Ollama Models"):
+            with st.sidebar.status("Refreshing models..."):
+                model_names, model_display_info = get_available_ollama_models(ollama_api_url)
+                st.session_state.available_ollama_models = model_names
+                st.session_state.ollama_model_display_info = model_display_info
+                st.session_state.ollama_models_fetched = True
+                st.sidebar.success(f"Found {len(model_names)} available Ollama models")
+                st.rerun()
+            
+    else:
+        # OpenAI settings
+        openai_api_key = st.sidebar.text_input(
+            "OpenAI API Key",
+            value=st.session_state.get("openai_api_key", ""),
+            type="password",
+            help="Your OpenAI API key (required for using OpenAI models)"
+        )
+        
+        # Update API key in session state if changed
+        api_key_changed = False
+        if openai_api_key != st.session_state.get("openai_api_key", ""):
+            st.session_state.openai_api_key = openai_api_key
+            api_key_changed = True
+            # Reset the models_fetched flag when API key changes
+            st.session_state.openai_models_fetched = False
+        
+        # Fetch models from API if key provided and not fetched yet or key changed
+        if openai_api_key and (not st.session_state.openai_models_fetched or api_key_changed):
+            with st.sidebar.status("Fetching available models..."):
+                # Try to fetch models from API
+                api_models = get_openai_models_from_api(openai_api_key)
+                
+                if api_models:
+                    st.session_state.available_openai_models = api_models
+                    st.session_state.openai_models_fetched = True
+                    # Success message will auto-dismiss
+                else:
+                    # If API call fails, use default models
+                    if api_key_changed:  # Only show error on explicit key change
+                        st.sidebar.error("Could not fetch models with this API key. Using default list.")
+                        st.session_state.available_openai_models = get_available_openai_models()
+        
+        # Available OpenAI models - either from API or defaults
+        openai_models = st.session_state.available_openai_models
+        
+        if openai_models:
+            # Model selection
+            openai_model = st.sidebar.selectbox(
+                "OpenAI Model",
+                options=openai_models,
+                index=0 if st.session_state.openai_model not in openai_models else openai_models.index(st.session_state.openai_model),
+                help="Select an OpenAI model to use for summaries and categorization"
+            )
+            
+            # Update session state
+            if openai_model != st.session_state.openai_model:
+                st.session_state.openai_model = openai_model
+        else:
+            st.sidebar.warning("No models available. Please enter a valid API key.")
+            
+        # Button to manually refresh models
+        if openai_api_key and st.sidebar.button("Refresh OpenAI Models"):
+            with st.sidebar.status("Refreshing models..."):
+                api_models = get_openai_models_from_api(openai_api_key)
+                if api_models:
+                    st.session_state.available_openai_models = api_models
+                    st.session_state.openai_models_fetched = True
+                    st.sidebar.success(f"Found {len(api_models)} available models")
+                    st.rerun()
+                else:
+                    st.sidebar.error("Failed to refresh models. Check your API key and connection.")
+            
+        # Warning about costs
+        st.sidebar.warning("⚠️ Using OpenAI models will incur API costs based on your usage.")
+    
+    # Test LLM connection
+    if st.sidebar.button("Test LLM Connection"):
+        with st.sidebar.status("Testing connection..."):
+            success, message = test_llm_connection()
+        
+        if success:
+            st.sidebar.success(f"✅ {message}")
+        else:
+            st.sidebar.error(f"❌ {message}")
+    
+    # Quick data info
+    st.sidebar.subheader("Data Status")
+    dates = load_available_dates()
+    if dates:
+        st.sidebar.info(f"📊 {len(dates)} days with data")
+        st.sidebar.text(f"Latest: {dates[0] if dates else 'None'}")
+    else:
+        st.sidebar.warning("No log data found")
+    
+    # Path info
+    st.sidebar.subheader("Storage Locations")
+    st.sidebar.info(f"Logs Directory: {LOGS_DIR}")
+
 # --- Main App ---
 def main():
-    st.set_page_config(
-        page_title="Focus Monitor Dashboard",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
-    # Add a dedicated test page
-    (
-        tab_dashboard,
-        tab_label_editor,
-        tab_summaries,
-        tab_categories,
-        tab_processor,
-        tab_test,
-    ) = st.tabs(
-        [
-            "📊 Dashboard",
-            "🏷 Activity Label Editor",
-            "📝 5-Min Summaries & Feedback",
-            "🏆 Activity Categories Manager",
-            "⏮️ Historical Processor",
-            "🧪 LLM Test",
-        ]
-    )
-
-    with tab_dashboard:
-        display_dashboard()
-    with tab_label_editor:
-        display_label_editor()
-    with tab_summaries:
-        display_time_bucket_summaries()
-    with tab_categories:
-        display_category_manager()
-    with tab_processor:
-        display_retroactive_processor()
-    with tab_test:
-        llm_test_page()  # Add the new test page
+    st.set_page_config(page_title="Focus Monitor", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+    display_control_panel()
+    tab_names = ["📊 Dashboard", "🏷 Activity Label Editor", "📝 5-Min Summaries", "🏆 Categories", "⏮️ Historical Processor", "🧪 LLM Test"]
+    tabs = st.tabs(tab_names)
+    
+    with tabs[0]: display_dashboard()
+    with tabs[1]: display_label_editor()
+    with tabs[2]: display_time_bucket_summaries()
+    with tabs[3]: display_category_manager()
+    with tabs[4]: display_retroactive_processor()
+    with tabs[5]: llm_test_page()
 
 
 if __name__ == "__main__":

@@ -2,3 +2,5 @@ focus_logs/*
 focus_logs/block_feedback.json
 focus_monitor.log
 focus_logs/block_feedback.json
+color_test_output/*
+dashboard/__pycache__/*
