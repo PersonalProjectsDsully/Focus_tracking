@@ -205,7 +205,9 @@ def create_category_chart(
         # Calculate duration if times are valid (pandas returns NaT for invalid dates)
         if pd.notna(start_time) and pd.notna(end_time):
             duration = (end_time - start_time).total_seconds()
-            category_times[cat_name] = category_times.get(cat_name, 0) + duration
+            # Only add positive durations to avoid negative time from corrupted data
+            if duration > 0:
+                category_times[cat_name] = category_times.get(cat_name, 0) + duration
 
     # Filter out categories with zero time
     category_times = {k: v for k, v in category_times.items() if v > 0}

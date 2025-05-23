@@ -1663,16 +1663,22 @@ def display_dashboard():
                     else "Uncategorized"
                 )
 
-                start_time = pd.to_datetime(bucket.get("start", ""))
-                end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")))
+                try:
+                    start_time = pd.to_datetime(bucket.get("start", ""), errors='coerce')
+                    end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")), errors='coerce')
+                except Exception:
+                    start_time = None
+                    end_time = None
 
-                if start_time and end_time:
+                if pd.notna(start_time) and pd.notna(end_time):
                     duration_seconds = (end_time - start_time).total_seconds()
-                    category_data.append(
-                        {
+                    # Only process positive durations to avoid corrupted data
+                    if duration_seconds > 0:
+                        category_data.append(
+                            {
                             "Category": cat_name,
-                            "Start Time": start_time.strftime("%H:%M"),
-                            "End Time": end_time.strftime("%H:%M"),
+                            "Start Time": start_time.strftime("%H:%M") + (f" {start_time.strftime('%Z')}" if start_time.tzinfo else ""),
+                            "End Time": end_time.strftime("%H:%M") + (f" {end_time.strftime('%Z')}" if end_time.tzinfo else ""),
                             "Duration (min)": round(duration_seconds / 60, 1),
                             "Summary": bucket.get("summary", "")[:50]
                             + (
@@ -1692,11 +1698,15 @@ def display_dashboard():
                     .sum()
                     .reset_index()
                 )
-                category_totals["Percentage"] = (
-                    category_totals["Duration (min)"]
-                    / category_totals["Duration (min)"].sum()
-                    * 100
-                ).round(1)
+                total_duration = category_totals["Duration (min)"].sum()
+                if total_duration > 0:
+                    category_totals["Percentage"] = (
+                        category_totals["Duration (min)"]
+                        / total_duration
+                        * 100
+                    ).round(1)
+                else:
+                    category_totals["Percentage"] = 0.0
                 category_totals = category_totals.sort_values(
                     "Duration (min)", ascending=False
                 )
@@ -1778,9 +1788,22 @@ def display_dashboard():
             required_raw_cols = ["timestamp", "app_name", "title", "duration"]
 
             if all(col in df_to_display.columns for col in required_raw_cols):
-                df_to_display["Formatted Time"] = pd.to_datetime(
-                    df_to_display["timestamp"], errors="coerce"
-                ).dt.strftime("%Y-%m-%d %H:%M:%S")
+                # Convert timestamps with comprehensive error handling
+                try:
+                    timestamp_series = pd.to_datetime(df_to_display["timestamp"], errors="coerce")
+                    
+                    # Check if we have a valid datetime series and any valid timestamps
+                    if hasattr(timestamp_series, 'dt') and timestamp_series.notna().any():
+                        df_to_display["Formatted Time"] = timestamp_series.dt.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        # If no valid timestamps or .dt accessor not available, format manually
+                        df_to_display["Formatted Time"] = df_to_display["timestamp"].apply(
+                            lambda x: str(x)[:19].replace('T', ' ') if isinstance(x, str) and len(str(x)) >= 19 else str(x)
+                        )
+                except Exception as e:
+                    # Ultimate fallback - just use original timestamps as strings
+                    print(f"Warning: Error formatting timestamps: {e}")
+                    df_to_display["Formatted Time"] = df_to_display["timestamp"].astype(str)
 
                 display_data = {}
                 if "Formatted Time" in df_to_display.columns:
