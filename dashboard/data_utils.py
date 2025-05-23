@@ -183,9 +183,16 @@ def generate_summary_from_logs(date_str: str) -> Optional[Dict[str, Any]]:
         return None 
 
     # Separate browser profile activities from regular activities
-    browser_profile_logs = logs_df_labeled[logs_df_labeled.get("detected_profile_category", "").notna() & 
-                                          (logs_df_labeled.get("detected_profile_category", "") != "")]
-    regular_logs = logs_df_labeled[~logs_df_labeled.index.isin(browser_profile_logs.index)]
+    # Check for detected_profile_category column existence and valid values
+    if "detected_profile_category" in logs_df_labeled.columns:
+        has_profile_category = (logs_df_labeled["detected_profile_category"].notna() & 
+                               (logs_df_labeled["detected_profile_category"] != ""))
+        browser_profile_logs = logs_df_labeled[has_profile_category]
+        regular_logs = logs_df_labeled[~has_profile_category]
+    else:
+        # No browser profile data, all logs are regular
+        browser_profile_logs = pd.DataFrame()
+        regular_logs = logs_df_labeled
 
     # Calculate total duration including browser activities
     total_duration_all = logs_df_labeled["duration"].sum()
@@ -606,8 +613,13 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
         return False
     
     # Filter out browser profile activities (they have detected_profile_category)
-    non_browser_logs = logs_df[~(logs_df.get("detected_profile_category", "").notna() & 
-                                (logs_df.get("detected_profile_category", "") != ""))]
+    if "detected_profile_category" in logs_df.columns:
+        has_profile_category = (logs_df["detected_profile_category"].notna() & 
+                               (logs_df["detected_profile_category"] != ""))
+        non_browser_logs = logs_df[~has_profile_category]
+    else:
+        # No browser profile column, all logs are non-browser
+        non_browser_logs = logs_df
     
     if non_browser_logs.empty:
         msg=f"No non-browser-profile activities found for {date_str} to create time buckets."

@@ -194,12 +194,16 @@ def create_category_chart(
             if cat_id else "Uncategorized"
         )
         
-        # Parse start and end times
-        start_time = pd.to_datetime(bucket.get("start", ""))
-        end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")))
+        # Parse start and end times with error handling
+        try:
+            start_time = pd.to_datetime(bucket.get("start", ""), errors='coerce')
+            end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")), errors='coerce')
+        except Exception:
+            start_time = None
+            end_time = None
         
-        # Calculate duration if times are valid
-        if start_time is not None and end_time is not None:
+        # Calculate duration if times are valid (pandas returns NaT for invalid dates)
+        if pd.notna(start_time) and pd.notna(end_time):
             duration = (end_time - start_time).total_seconds()
             category_times[cat_name] = category_times.get(cat_name, 0) + duration
 

@@ -14,21 +14,16 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import psutil
-from dashboard.data_utils import (
-     load_browser_profiles, save_browser_profiles, get_available_exe_patterns,
-     validate_browser_profile, hex_to_rgb, rgb_to_hex, get_default_search_rect_for_browser
-)
-
-# Import all utility functions from dashboard modules
+# Import all utility functions from dashboard modules in a single import
 from dashboard.data_utils import (
     load_available_dates, load_log_entries, load_daily_summary, generate_summary_from_logs,
     load_labels, save_labels, apply_labels_to_logs, group_activities_for_labeling,
     load_block_feedback, save_block_feedback, load_time_buckets_for_date,
     update_bucket_summary_in_file, load_categories, save_categories,
     update_bucket_category_in_file, generate_time_buckets_from_logs,
-    # Add these new imports:
     load_browser_profiles, save_browser_profiles, get_available_exe_patterns,
     validate_browser_profile, hex_to_rgb, rgb_to_hex, get_default_search_rect_for_browser,
+    load_daily_browser_activities,  # Added missing import
     LOGS_DIR, LABELS_FILE, FEEDBACK_FILE, CATEGORIES_FILE
 )
 from dashboard.llm_utils import (
@@ -43,12 +38,79 @@ from dashboard.charts import (
 
 # --- Tracker Control Functions ---
 def is_tracker_running():
-    pid = st.session_state.get("tracker_pid")
-    if pid is None: return False
+    """
+    Check if any standalone_focus_monitor.py process is running.
+    This will detect the tracker regardless of how it was started.
+    """
     try:
-        return psutil.pid_exists(pid) and "standalone_focus_monitor.py" in " ".join(psutil.Process(pid).cmdline())
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        # First, check if we have a PID from dashboard-started process
+        stored_pid = st.session_state.get("tracker_pid")
+        if stored_pid:
+            try:
+                if psutil.pid_exists(stored_pid):
+                    process = psutil.Process(stored_pid)
+                    if "standalone_focus_monitor.py" in " ".join(process.cmdline()):
+                        return True
+                # If stored PID is invalid, clear it
+                st.session_state["tracker_pid"] = None
+                st.session_state["tracker_process"] = None
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                st.session_state["tracker_pid"] = None
+                st.session_state["tracker_process"] = None
+        
+        # Search for any running standalone_focus_monitor.py process
+        for process in psutil.process_iter(['pid', 'cmdline']):
+            try:
+                cmdline = process.info['cmdline']
+                if cmdline and any("standalone_focus_monitor.py" in arg for arg in cmdline):
+                    # Found a running tracker, update session state if we don't have one
+                    if not st.session_state.get("tracker_pid"):
+                        st.session_state["tracker_pid"] = process.info['pid']
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        
         return False
+    except Exception:
+        return False
+
+def get_tracker_status():
+    """
+    Get detailed status information about the tracker process.
+    Returns a dictionary with status details.
+    """
+    status = {
+        "running": False,
+        "pid": None,
+        "started_by_dashboard": False,
+        "start_time": None,
+        "memory_usage": None
+    }
+    
+    try:
+        # Check if tracker is running
+        if not is_tracker_running():
+            return status
+            
+        pid = st.session_state.get("tracker_pid")
+        if not pid:
+            return status
+            
+        process = psutil.Process(pid)
+        status["running"] = True
+        status["pid"] = pid
+        status["started_by_dashboard"] = bool(st.session_state.get("tracker_process"))
+        
+        try:
+            status["start_time"] = datetime.fromtimestamp(process.create_time()).strftime("%Y-%m-%d %H:%M:%S")
+            status["memory_usage"] = f"{process.memory_info().rss / 1024 / 1024:.1f} MB"
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+            
+    except Exception:
+        pass
+        
+    return status
     
 def start_tracker():
     if is_tracker_running():
@@ -67,8 +129,11 @@ def start_tracker():
         
     try:
         # Start detached if possible, or manage process carefully
-        process = subprocess.Popen([sys.executable, str(script_path)])
+        process = subprocess.Popen([sys.executable, str(script_path)], 
+                                 stdout=subprocess.DEVNULL, 
+                                 stderr=subprocess.DEVNULL)
         st.session_state["tracker_pid"] = process.pid
+        st.session_state["tracker_process"] = process  # Store process handle to prevent zombies
         st.success(f"Focus tracker started (PID: {process.pid})")
         time.sleep(1) # Give it a moment to stabilize
     except Exception as e:
@@ -76,13 +141,32 @@ def start_tracker():
 
 
 def stop_tracker():
-    pid = st.session_state.get("tracker_pid")
-    if not pid or not is_tracker_running(): # Use is_tracker_running for robust check
-        st.info("Focus tracker is not running or PID is stale.")
+    """
+    Stop any running standalone_focus_monitor.py process.
+    This will work even if the process was started externally.
+    """
+    if not is_tracker_running():
+        st.info("Focus tracker is not currently running.")
         st.session_state["tracker_pid"] = None
+        st.session_state["tracker_process"] = None
         return
+    
+    # Get the PID (either from session state or detected)
+    pid = st.session_state.get("tracker_pid")
+    if not pid:
+        st.error("Could not determine tracker process ID.")
+        return
+        
     try:
         p = psutil.Process(pid)
+        # Verify this is actually our tracker process before terminating
+        cmdline = " ".join(p.cmdline())
+        if "standalone_focus_monitor.py" not in cmdline:
+            st.error("Process found but doesn't appear to be the focus tracker.")
+            st.session_state["tracker_pid"] = None
+            st.session_state["tracker_process"] = None
+            return
+            
         p.terminate() # SIGTERM
         p.wait(timeout=5) 
         st.success("Focus tracker stop signal sent.")
@@ -100,6 +184,7 @@ def stop_tracker():
         st.error(f"Failed to stop tracker: {e}")
     finally:
         st.session_state["tracker_pid"] = None
+        st.session_state["tracker_process"] = None
 
 def display_browser_profile_manager():
     st.title("🌐 Browser Profile Manager")
@@ -1779,8 +1864,22 @@ def display_control_panel():
     
     # Tracker control
     st.sidebar.subheader("Tracker Status")
-    if is_tracker_running():
+    tracker_status = get_tracker_status()
+    
+    if tracker_status["running"]:
         st.sidebar.success("✅ Focus Tracker Running")
+        
+        # Show detailed status information
+        with st.sidebar.expander("📊 Tracker Details", expanded=False):
+            st.write(f"**PID:** {tracker_status['pid']}")
+            if tracker_status["start_time"]:
+                st.write(f"**Started:** {tracker_status['start_time']}")
+            if tracker_status["memory_usage"]:
+                st.write(f"**Memory:** {tracker_status['memory_usage']}")
+            
+            origin = "Dashboard" if tracker_status["started_by_dashboard"] else "External"
+            st.write(f"**Started by:** {origin}")
+        
         if st.sidebar.button("Stop Tracker"):
             stop_tracker()
             st.rerun()

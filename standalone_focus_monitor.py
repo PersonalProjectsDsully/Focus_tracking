@@ -15,6 +15,11 @@ Key Changes for Browser Profile Daily Aggregation:
 - 5-minute buckets only contain non-browser-profile activities
 - All other functionality preserved (OCR, focus scoring, classifications, etc.)
 
+Timezone Handling:
+- All timestamps are now recorded in Eastern Time (America/New_York timezone)
+- Uses zoneinfo (Python 3.9+) or falls back to pytz for timezone support
+- Date boundaries are calculated based on Eastern Time, not UTC
+
 NOTE: LLM processing has been moved to the dashboard for better user control.
 Browser profile configuration is now managed through the dashboard UI.
 The agent now focuses purely on data collection and profile detection.
@@ -33,6 +38,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 import warnings
 import numpy as np  # Add this import for array operations with image data
+
+# Import timezone handling - prefer zoneinfo (Python 3.9+), fallback to pytz
+try:
+    from zoneinfo import ZoneInfo
+    TIMEZONE_LIB = "zoneinfo"
+    EASTERN_TZ = ZoneInfo("America/New_York")
+except ImportError:
+    try:
+        import pytz
+        TIMEZONE_LIB = "pytz"
+        EASTERN_TZ = pytz.timezone("America/New_York")
+    except ImportError:
+        TIMEZONE_LIB = "none"
+        EASTERN_TZ = None
+        print("Warning: Neither zoneinfo nor pytz available. Using system local time.")
 
 # Filter out specific Streamlit warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="streamlit")
@@ -56,6 +76,8 @@ try:
     import win32con 
     import win32gui
     import win32process
+    import ctypes
+    from ctypes import wintypes
     # WMI is optional for advanced Chrome profile detection, can be removed if not used/working.
     # import wmi 
 except ImportError:
@@ -111,8 +133,31 @@ EDGE_PROFILE_PATTERN = re.compile(r"Microsoft Edge(?:\s*-\s*(.+))?$")
 CHROME_PROFILE_PATTERN = re.compile(r".*Google Chrome(?: - (?!New Tab|Settings|History|Downloads|Extensions)(.+))?$") # Improved to avoid common non-profile window parts
 FIREFOX_PROFILE_PATTERN = re.compile(r"Mozilla Firefox(?:\s*-\s*(.+))?$")
 
+# Helper functions for timezone handling
+def get_current_eastern_time() -> datetime.datetime:
+    """Get current time in Eastern timezone."""
+    if EASTERN_TZ:
+        return datetime.datetime.now(EASTERN_TZ)
+    else:
+        # Fallback to local time if timezone libraries not available
+        return datetime.datetime.now()
+
+def get_current_eastern_date() -> str:
+    """Get current date in Eastern timezone as YYYY-MM-DD string."""
+    return get_current_eastern_time().strftime("%Y-%m-%d")
+
+def eastern_datetime_to_iso(dt: datetime.datetime) -> str:
+    """Convert Eastern datetime to ISO string."""
+    if EASTERN_TZ and dt.tzinfo is None:
+        # If datetime is naive, assume it's Eastern time
+        if TIMEZONE_LIB == "zoneinfo":
+            dt = dt.replace(tzinfo=EASTERN_TZ)
+        elif TIMEZONE_LIB == "pytz":
+            dt = EASTERN_TZ.localize(dt)
+    return dt.isoformat()
+
 # --- Set to True during setup/debugging, False in production ---
-COLOR_DETECTION_DEBUG = True
+COLOR_DETECTION_DEBUG = False
 
 # Browser profiles are now loaded from JSON configuration file managed by the dashboard
 # No hardcoded profiles here anymore
@@ -126,13 +171,13 @@ class FocusMonitorAgent:
         self.desired_active_state = True  # State requested by backend (if API used)
         self.last_window_info: Optional[Dict] = None
         self.window_start_time: float = time.time()
-        self.today: str = self._get_current_utc_date() # Store date as YYYY-MM-DD
+        self.today: str = get_current_eastern_date() # Store date as YYYY-MM-DD
         self.last_summary_time: float = 0 # Initialize to ensure first summary runs
         self.summary_interval: int = 300  # Generate summary every 5 minutes by default
 
         # Session start timestamp for 5-minute buckets
-        self.session_start_time: float = time.time() # UTC timestamp for session start
-        self.session_start_tag: str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.session_start_time: float = time.time() # Unix timestamp for session start
+        self.session_start_tag: str = get_current_eastern_time().strftime("%Y%m%dT%H%M%S")
         self.time_buckets: Dict[int, Dict[str, Any]] = {} # bucket_index: bucket_data
         
         # NEW: Daily browser profile aggregation
@@ -161,6 +206,8 @@ class FocusMonitorAgent:
             f"Initialized FocusMonitorAgent with Browser Profile Daily Aggregation. Output Dir: {self.focus_logs_dir}, API URL: {self.api_url or 'Disabled'}"
         )
         logger.info("LLM processing disabled in agent - handled by dashboard for user control")
+        logger.info(f"Using timezone: {EASTERN_TZ if EASTERN_TZ else 'System Local'} (Library: {TIMEZONE_LIB})")
+        logger.info(f"Current date: {self.today} (Eastern)")
         logger.info(f"Loaded {len(self.browser_profiles)} browser profiles for color detection")
         if not OCR_AVAILABLE:
             logger.warning("OCR features disabled as pytesseract/Pillow are not available.")
@@ -236,22 +283,76 @@ class FocusMonitorAgent:
         """Get monitor information using Windows API."""
         monitors = []
         try:
-            def enum_display_monitors_callback(hmonitor, hdc, rect, data):
+            # Alternative approach using GetSystemMetrics for primary monitor
+            # and falling back to a simple default if enumeration fails
+            try:
+                def enum_display_monitors_callback(hmonitor, hdc, rect, data):
+                    monitors.append({
+                        'left': rect[0],
+                        'top': rect[1], 
+                        'right': rect[2],
+                        'bottom': rect[3],
+                        'width': rect[2] - rect[0],
+                        'height': rect[3] - rect[1]
+                    })
+                    return True
+                
+                # Try the EnumDisplayMonitors approach first
+                win32api.EnumDisplayMonitors(enum_display_monitors_callback, 0)
+            except (AttributeError, TypeError) as enum_error:
+                logger.debug(f"EnumDisplayMonitors failed ({enum_error}), using fallback method")
+                # Fallback: Get primary monitor info using GetSystemMetrics
+                primary_width = win32api.GetSystemMetrics(0)  # SM_CXSCREEN
+                primary_height = win32api.GetSystemMetrics(1)  # SM_CYSCREEN
                 monitors.append({
-                    'left': rect[0],
-                    'top': rect[1], 
-                    'right': rect[2],
-                    'bottom': rect[3],
-                    'width': rect[2] - rect[0],
-                    'height': rect[3] - rect[1]
+                    'left': 0,
+                    'top': 0,
+                    'right': primary_width,
+                    'bottom': primary_height,
+                    'width': primary_width,
+                    'height': primary_height
                 })
-                return True
             
-            # Fix the EnumDisplayMonitors call - it takes 4 arguments, not 2
-            win32api.EnumDisplayMonitors(None, None, enum_display_monitors_callback, None)
+            logger.debug(f"Detected {len(monitors)} monitors: {monitors}")
             return monitors
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error enumerating monitors: {e}")
             return []
+
+    def _get_window_monitor(self, window_rect: tuple) -> Optional[Dict[str, int]]:
+        """Determine which monitor a window is primarily on based on its center point."""
+        monitors = self._get_monitor_info()
+        if not monitors:
+            return None
+            
+        # Calculate window center
+        window_center_x = (window_rect[0] + window_rect[2]) // 2
+        window_center_y = (window_rect[1] + window_rect[3]) // 2
+        
+        # Find monitor containing the center point
+        for monitor in monitors:
+            if (monitor['left'] <= window_center_x <= monitor['right'] and
+                monitor['top'] <= window_center_y <= monitor['bottom']):
+                return monitor
+                
+        # If center is not in any monitor (edge case), find monitor with most overlap
+        max_overlap = 0
+        best_monitor = None
+        
+        for monitor in monitors:
+            # Calculate intersection
+            left = max(window_rect[0], monitor['left'])
+            top = max(window_rect[1], monitor['top'])
+            right = min(window_rect[2], monitor['right'])
+            bottom = min(window_rect[3], monitor['bottom'])
+            
+            if right > left and bottom > top:
+                overlap = (right - left) * (bottom - top)
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    best_monitor = monitor
+                    
+        return best_monitor
 
     def analyze_color_region(self, hwnd, target_color_rgb, search_rect, tolerance=20):
         """
@@ -281,8 +382,10 @@ class FocusMonitorAgent:
             
             capture_bbox_screen = (x1, y1, x2, y2)
             
-            # Verify the coordinates are valid
-            if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0:
+            # Verify the coordinates form a valid rectangle (width and height > 0)
+            # Note: In multi-monitor setups, coordinates can be negative
+            if x2 <= x1 or y2 <= y1:
+                logger.debug(f"Invalid search region: ({x1},{y1}) to ({x2},{y2})")
                 return False
                 
             # Get monitor information
@@ -297,8 +400,15 @@ class FocusMonitorAgent:
                         min_x_all = min(m['left'] for m in monitors)
                         min_y_all = min(m['top'] for m in monitors)
                     else:
-                        min_x_all = 0 
-                        min_y_all = 0
+                        # If monitor enumeration failed, try to use window coordinates to estimate
+                        # Ensure we have valid window coordinates before proceeding
+                        if window_rect and len(window_rect) >= 4:
+                            min_x_all = min(0, window_rect[0])
+                            min_y_all = min(0, window_rect[1])
+                            logger.debug(f"No monitor info available, using estimated min coords: ({min_x_all},{min_y_all})")
+                        else:
+                            logger.debug("Invalid window coordinates, cannot estimate monitor bounds")
+                            return False
 
                     full_virtual_desktop_img = ImageGrab.grab(bbox=None, include_layered_windows=False, all_screens=True)
                     
@@ -317,15 +427,17 @@ class FocusMonitorAgent:
                         region_img = full_virtual_desktop_img.crop(final_crop_box_virtual)
                         grab_all_successful = True
 
-                except (TypeError, AttributeError):
-                    pass
-                except Exception:
-                    pass
+                except (TypeError, AttributeError) as e:
+                    logger.debug(f"Method 3a failed with type/attribute error: {e}")
+                except Exception as e:
+                    logger.debug(f"Method 3a failed with unexpected error: {e}")
                 
                 if grab_all_successful and region_img:
                     img_array_check = np.array(region_img)
                     if img_array_check.size == 0 or (img_array_check.ndim == 3 and img_array_check[:,:,:3].sum() == 0):
                         region_img = None
+                    else:
+                        logger.debug(f"Method 3a (all_screens=True) succeeded for window at {window_rect}")
 
             # Method 1: Standard PIL ImageGrab with specific bbox (fallback)
             if not region_img:
@@ -336,10 +448,13 @@ class FocusMonitorAgent:
                         img_array_check = np.array(region_img)
                         if img_array_check.size == 0 or (img_array_check.ndim == 3 and img_array_check[:,:,:3].sum() == 0):
                             region_img = None
+                        else:
+                            logger.debug(f"Method 1 (standard bbox grab) succeeded for window at {window_rect}")
                     else:
                         region_img = None
                         
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Method 1 failed: {e}")
                     region_img = None
             
             # Method 2: Try grabbing entire primary screen first, then crop (fallback)
@@ -402,9 +517,12 @@ class FocusMonitorAgent:
                 
             # Save debug image if debug is enabled
             if COLOR_DETECTION_DEBUG:
-                debug_filename = f"color_debug_{int(time.time())}_{hwnd}.png"
+                window_monitor = self._get_window_monitor(window_rect)
+                monitor_info = f"monitor_{window_monitor['left']}x{window_monitor['top']}" if window_monitor else "no_monitor"
+                debug_filename = f"color_debug_{int(time.time())}_{hwnd}_{monitor_info}.png"
                 debug_filepath = self.screenshot_dir / debug_filename
                 region_img.save(debug_filepath)
+                logger.debug(f"Saved debug image: {debug_filename} - Window on {monitor_info}")
             
             # Convert to numpy array for color analysis
             img_array = np.array(region_img)
@@ -483,9 +601,7 @@ class FocusMonitorAgent:
         
         return ""  # No match found
 
-    def _get_current_utc_date(self) -> str:
-        # Use UTC date for consistency across timezones
-        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    # Removed _get_current_utc_date - now using get_current_eastern_date() helper function
 
     async def check_backend_status(self):
         """Periodically check the desired active state from the backend (if API URL is set)."""
@@ -638,10 +754,15 @@ class FocusMonitorAgent:
                         window_rect = win32gui.GetWindowRect(hwnd)
                         # ImageGrab.grab can take a bbox argument. Ensure it's not an empty rect.
                         if window_rect[2] > window_rect[0] and window_rect[3] > window_rect[1]:
-                            captured_image = ImageGrab.grab(bbox=window_rect)
+                            # Try all_screens=True for multi-monitor support
+                            try:
+                                captured_image = ImageGrab.grab(bbox=window_rect, all_screens=True)
+                            except (TypeError, AttributeError):
+                                # Fallback to standard grab if all_screens not supported
+                                captured_image = ImageGrab.grab(bbox=window_rect)
                             # Create a unique filename for the screenshot
                             timestamp_filename_part = int(time.time())
-                            hwnd_filename_part = hwnd if hwnd else "nohwnd" # Handle if hwnd is 0 (unlikely here)
+                            hwnd_filename_part = hwnd if hwnd is not None else "nohwnd" # Handle if hwnd is None
                             screenshot_filename = f"{timestamp_filename_part}_{hwnd_filename_part}.png"
                             
                             full_screenshot_path = self.screenshot_dir / screenshot_filename
@@ -665,16 +786,20 @@ class FocusMonitorAgent:
                 "exe": exe_full_path, # Store the full original exe path
                 "title": window_title,
                 "app_name_identity": app_identity_name, # This is the name used for initial logging (app_name field)
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "timestamp": eastern_datetime_to_iso(get_current_eastern_time()),
                 "ocr_text": ocr_text_content, # From current capture attempt, if any
                 "screenshot_path": screenshot_file_rel_path, # Relative path, if any
             }
         except Exception as e_main_details:
             # Handle specific pywintypes errors that occur if a window closes during query
-            if "pywintypes.error" in str(type(e_main_details)) and hasattr(e_main_details, 'args') and e_main_details.args and e_main_details.args[0] in [0, 5, 1400]: # 5: Access Denied, 1400: Invalid window handle
-                logger.debug(f"Window likely closed or inaccessible during info retrieval: {e_main_details}")
-            else:
-                logger.error(f"Error getting focused window details: {e_main_details}", exc_info=False) # exc_info=False to reduce log noise for common errors
+            try:
+                # Check if it's a pywintypes error by accessing winerror attribute
+                if hasattr(e_main_details, 'winerror') and e_main_details.winerror in [0, 5, 1400]: # 5: Access Denied, 1400: Invalid window handle
+                    logger.debug(f"Window likely closed or inaccessible during info retrieval: {e_main_details}")
+                else:
+                    logger.error(f"Error getting focused window details: {e_main_details}", exc_info=False) # exc_info=False to reduce log noise for common errors
+            except:
+                logger.error(f"Error getting focused window details: {e_main_details}", exc_info=False)
             return None
 
     def _log_window_activity(self, window_info: Dict[str, Any], duration_seconds: int):
@@ -735,7 +860,8 @@ class FocusMonitorAgent:
             elif cached_ocr: log_entry["screenshot_path"] = cached_ocr.get("path")
 
             # Clean up OCR timestamp cache if entry processed
-            if hwnd in self.ocr_last_times: self.ocr_last_times.pop(hwnd, None)
+            if hwnd and hwnd in self.ocr_last_times:
+                del self.ocr_last_times[hwnd]
 
             # Always log to JSONL file for complete record
             with open(log_file_path, "a", encoding="utf-8") as f:
@@ -798,7 +924,7 @@ class FocusMonitorAgent:
             log_ts = time.time() # Fallback if ISO format is wrong
 
         # Calculate bucket index based on session start time
-        bucket_index = int((log_ts - self.session_start_time) // 300) # 300 seconds = 5 minutes
+        bucket_index = max(0, int((log_ts - self.session_start_time) // 300)) # 300 seconds = 5 minutes, ensure non-negative
         
         # Check if we've moved to a new bucket
         if self.current_bucket_index is not None and bucket_index != self.current_bucket_index:
@@ -815,8 +941,8 @@ class FocusMonitorAgent:
         bucket_data = self.time_buckets.setdefault(
             bucket_index,
             {
-                "start": datetime.datetime.fromtimestamp(current_bucket_start_ts, tz=datetime.timezone.utc).isoformat(),
-                "end": datetime.datetime.fromtimestamp(current_bucket_end_ts, tz=datetime.timezone.utc).isoformat(),
+                "start": eastern_datetime_to_iso(datetime.datetime.fromtimestamp(current_bucket_start_ts, tz=EASTERN_TZ) if EASTERN_TZ else datetime.datetime.fromtimestamp(current_bucket_start_ts)),
+                "end": eastern_datetime_to_iso(datetime.datetime.fromtimestamp(current_bucket_end_ts, tz=EASTERN_TZ) if EASTERN_TZ else datetime.datetime.fromtimestamp(current_bucket_end_ts)),
                 "apps": set(), "titles": set(), "ocr_text": set(), 
                 "summary": "", "category_id": "" # Empty - to be filled by dashboard
             }
@@ -857,9 +983,9 @@ class FocusMonitorAgent:
             serializable_buckets_list.append({
                 "start": bucket_content["start"], 
                 "end": bucket_content["end"],
-                "apps": sorted(list(bucket_content.get("apps", set()))), # Convert sets to sorted lists
-                "titles": sorted(list(bucket_content.get("titles", set()))),
-                "ocr_text": sorted(list(bucket_content.get("ocr_text", set()))),
+                "apps": sorted([x for x in bucket_content.get("apps", set()) if x]), # Convert sets to sorted lists, filter out empty/None values
+                "titles": sorted([x for x in bucket_content.get("titles", set()) if x]),
+                "ocr_text": sorted([x for x in bucket_content.get("ocr_text", set()) if x]),
                 "summary": bucket_content.get("summary", ""), # Will be empty until dashboard processes
                 "category_id": bucket_content.get("category_id", "") # May be set by color detection
             })
@@ -884,9 +1010,9 @@ class FocusMonitorAgent:
             serializable_browser_data.append({
                 "category_id": category_id,
                 "total_duration": agg_data["total_duration"],
-                "titles": sorted(list(agg_data.get("titles", set()))),
-                "ocr_text": sorted(list(agg_data.get("ocr_text", set()))),
-                "app_names": sorted(list(agg_data.get("app_names", set()))),
+                "titles": sorted([x for x in agg_data.get("titles", set()) if x]),
+                "ocr_text": sorted([x for x in agg_data.get("ocr_text", set()) if x]),
+                "app_names": sorted([x for x in agg_data.get("app_names", set()) if x]),
                 "start_time": agg_data["start_time"],
                 "last_activity": agg_data["last_activity"],
                 "activity_count": agg_data["activity_count"]
@@ -1056,7 +1182,7 @@ class FocusMonitorAgent:
         
         if is_prod_exe:
             # If it's a productive exe, ensure no distraction keywords are in titles
-            if not any(dist_keyword in titles_concatenated_lower for dist_keyword in DISTRACTION_TITLE_KEYWORDS if dist_keyword in titles_concatenated_lower):
+            if not any(dist_keyword in titles_concatenated_lower for dist_keyword in DISTRACTION_TITLE_KEYWORDS):
                 return True
         return False
 
@@ -1083,7 +1209,7 @@ class FocusMonitorAgent:
             else:
                 if exe_basename_lower.replace(".exe", "") == prod_exe_pattern: is_potentially_prod_exe = True; break
         
-        if is_potentially_prod_exe and any(dist_keyword in titles_concatenated_lower for dist_keyword in DISTRACTION_TITLE_KEYWORDS if dist_keyword in titles_concatenated_lower):
+        if is_potentially_prod_exe and any(dist_keyword in titles_concatenated_lower for dist_keyword in DISTRACTION_TITLE_KEYWORDS):
             return True
         return False
 
@@ -1100,7 +1226,7 @@ class FocusMonitorAgent:
                 if exe_basename_lower.replace(".exe", "") == meet_exe_pattern: is_meet_exe = True; break
         if is_meet_exe: return True
         
-        if any(meet_keyword in title_str_lower for meet_keyword in MEETING_TITLE_KEYWORDS if meet_keyword in title_str_lower):
+        if any(meet_keyword in title_str_lower for meet_keyword in MEETING_TITLE_KEYWORDS):
             return True
         return False
     
@@ -1174,7 +1300,7 @@ class FocusMonitorAgent:
             loop_iteration_start_time = time.time()
             try:
                 # Check desired state from backend and toggle internal state if needed
-                if self.api_url : self.toggle_active() # Only toggle if API is configured
+                if self.api_url: self.toggle_active() # Only toggle if API is configured
 
                 if not self.active: # If agent is paused
                     # Still check if it's time to generate a daily summary for past activity
@@ -1193,11 +1319,11 @@ class FocusMonitorAgent:
                     continue # Skip window processing if not active
 
                 # --- Active Monitoring ---
-                # Day Change Check (using UTC date)
-                current_utc_date_str = self._get_current_utc_date()
-                if current_utc_date_str != self.today:
+                # Day Change Check (using Eastern date)
+                current_eastern_date_str = get_current_eastern_date()
+                if current_eastern_date_str != self.today:
                     logger.info(
-                        f"Date changed from {self.today} to {current_utc_date_str}. Processing previous day's data."
+                        f"Date changed from {self.today} to {current_eastern_date_str}. Processing previous day's data."
                     )
                     # Finalize any active bucket before day change
                     if self.current_bucket_index is not None:
@@ -1208,16 +1334,16 @@ class FocusMonitorAgent:
                     self._write_daily_browser_aggregation() # Write out browser aggregations for the day that just ended
                     
                     # Reset for the new day
-                    self.today = current_utc_date_str
+                    self.today = current_eastern_date_str
                     self.session_start_time = time.time() # New session starts now
-                    self.session_start_tag = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    self.session_start_tag = get_current_eastern_time().strftime("%Y%m%dT%H%M%S")
                     self.time_buckets = {} # Clear buckets for the new session
                     self.daily_browser_activities = {} # Clear daily browser aggregation for new day
                     self.finalized_buckets = set() # Clear finalized buckets tracking
                     self.current_bucket_index = None # Reset current bucket tracking
                     self.last_window_info = None # Treat as fresh start for window tracking
                     self.window_start_time = time.time()
-                    logger.info(f"Updated current tracking date to {self.today}. New session tag: {self.session_start_tag}. Browser aggregation reset.")
+                    logger.info(f"Updated current tracking date to {self.today} (Eastern). New session tag: {self.session_start_tag}. Browser aggregation reset.")
 
                 # Get current focused window details
                 current_focused_win_details = self._get_focused_window_details()
@@ -1361,8 +1487,24 @@ async def main_async_entrypoint():
         logger.info("All agent background tasks have been processed.")
 
 
+def setup_dpi_awareness():
+    """Set DPI awareness for better multi-monitor support with different DPI settings."""
+    try:
+        # Try to set per-monitor DPI awareness (Windows 8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        logger.info("Set per-monitor DPI awareness")
+    except Exception:
+        try:
+            # Fallback to system DPI awareness (Windows Vista+)
+            ctypes.windll.user32.SetProcessDPIAware()
+            logger.info("Set system DPI awareness")
+        except Exception as e:
+            logger.warning(f"Could not set DPI awareness: {e}")
+
+
 if __name__ == "__main__":
     try:
+        setup_dpi_awareness()
         asyncio.run(main_async_entrypoint())
     except KeyboardInterrupt:
         logger.info("Focus Monitor Agent stopped by user (Ctrl+C in main).")
