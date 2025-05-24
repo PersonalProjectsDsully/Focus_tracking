@@ -196,8 +196,8 @@ def create_category_chart(
         
         # Parse start and end times with error handling
         try:
-            start_time = pd.to_datetime(bucket.get("start", ""), errors='coerce')
-            end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")), errors='coerce')
+            start_time = pd.to_datetime(bucket.get("start", ""), errors='coerce', utc=True)
+            end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")), errors='coerce', utc=True)
         except Exception:
             start_time = None
             end_time = None

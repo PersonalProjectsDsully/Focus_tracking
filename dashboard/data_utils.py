@@ -638,7 +638,7 @@ def generate_time_buckets_from_logs(date_str: str) -> bool:
         return False
 
     try:
-        non_browser_logs["timestamp"] = pd.to_datetime(non_browser_logs["timestamp"], errors='coerce')
+        non_browser_logs["timestamp"] = pd.to_datetime(non_browser_logs["timestamp"], errors='coerce', utc=True)
         non_browser_logs.dropna(subset=["timestamp"], inplace=True) 
         if non_browser_logs.empty:
              msg="No valid timestamps in non-browser log data after conversion."

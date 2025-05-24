@@ -688,8 +688,8 @@ def display_retroactive_processor():
         st.subheader("Sample of Existing Time Buckets (Max 5 Shown)")
         categories_map = {cat.get("id"): cat.get("name", "Unknown") for cat in load_categories()}
         for i, bucket in enumerate(existing_buckets_for_date[:5]):
-            start_dt = pd.to_datetime(bucket.get("start")).strftime("%H:%M")
-            end_dt = pd.to_datetime(bucket.get("end")).strftime("%H:%M")
+            start_dt = pd.to_datetime(bucket.get("start"), utc=True).strftime("%H:%M")
+            end_dt = pd.to_datetime(bucket.get("end"), utc=True).strftime("%H:%M")
             cat_name = categories_map.get(bucket.get("category_id", ""), "Uncategorized")
             
             # Show if bucket has LLM summary or not
@@ -705,9 +705,10 @@ def display_retroactive_processor():
                 
                 st.caption(f"Titles: {len(bucket.get('titles',[]))}, OCR: {len(bucket.get('ocr_text',[]))}")
                 
-                # Show raw data in expandable section
+                # Show raw data with toggle instead of nested expander
                 if bucket.get('titles') or bucket.get('ocr_text'):
-                    with st.expander("View Raw Data"):
+                    show_raw_data = st.toggle(f"Show Raw Data", key=f"show_raw_{i}_{bucket.get('start', 'unknown')}")
+                    if show_raw_data:
                         if bucket.get('titles'):
                             st.write("**Window Titles:**")
                             for title in bucket.get('titles', [])[:10]:  # Show first 10
@@ -1008,7 +1009,7 @@ def display_time_bucket_summaries():
                 continue
         
         displayed_count += 1
-        start_dt_fmt = pd.to_datetime(bucket_start_iso).strftime('%H:%M')
+        start_dt_fmt = pd.to_datetime(bucket_start_iso, utc=True).strftime('%H:%M')
         exp_title = f"{start_dt_fmt} (Session: {session_tag}) - [{current_cat_name}]"
         if not current_cat_id: 
             exp_title += " ⚠️"
@@ -1664,8 +1665,8 @@ def display_dashboard():
                 )
 
                 try:
-                    start_time = pd.to_datetime(bucket.get("start", ""), errors='coerce')
-                    end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")), errors='coerce')
+                    start_time = pd.to_datetime(bucket.get("start", ""), errors='coerce', utc=True)
+                    end_time = pd.to_datetime(bucket.get("end", bucket.get("start", "")), errors='coerce', utc=True)
                 except Exception:
                     start_time = None
                     end_time = None
@@ -1790,7 +1791,8 @@ def display_dashboard():
             if all(col in df_to_display.columns for col in required_raw_cols):
                 # Convert timestamps with comprehensive error handling
                 try:
-                    timestamp_series = pd.to_datetime(df_to_display["timestamp"], errors="coerce")
+                    # Use utc=True to handle mixed timezones and silence future warning
+                    timestamp_series = pd.to_datetime(df_to_display["timestamp"], errors="coerce", utc=True)
                     
                     # Check if we have a valid datetime series and any valid timestamps
                     if hasattr(timestamp_series, 'dt') and timestamp_series.notna().any():
@@ -1847,7 +1849,7 @@ def display_dashboard():
         )
         for ts, note_text in list(notes_for_selected_date.items())[-3:]:
             st.caption(
-                f"_{pd.to_datetime(ts).strftime('%H:%M')}_: {note_text[:70]}{'...' if len(note_text) > 70 else ''}"
+                f"_{pd.to_datetime(ts, utc=True).strftime('%H:%M')}_: {note_text[:70]}{'...' if len(note_text) > 70 else ''}"
             )
     else:
         st.info(
