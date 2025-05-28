@@ -1,6 +1,7 @@
 
 import json
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 import requests
 import streamlit as st
@@ -21,9 +22,13 @@ DEFAULT_LLM_MODEL = "llama3.1:8b" # Example, ensure this is a valid model you ha
 # Default OpenAI settings
 DEFAULT_OPENAI_MODEL = "gpt-3.5-turbo"
 
+# Default LM Studio settings
+DEFAULT_LM_STUDIO_API_URL = "http://localhost:1234/api/v0/chat/completions"
+DEFAULT_LM_STUDIO_MODEL = "granite-3.0-2b-instruct"  # Example, will be fetched from API
+
 def _call_llm_api(prompt: str, operation_name: str = "LLM call") -> Optional[str]:
     """
-    Call the LLM API based on the selected provider (Ollama or OpenAI)
+    Call the LLM API based on the selected provider (Ollama, OpenAI, or LM Studio)
     
     This function checks the session state for API configuration and uses the appropriate
     provider. Falls back to Ollama as the default provider.
@@ -43,6 +48,11 @@ def _call_llm_api(prompt: str, operation_name: str = "LLM call") -> Optional[str
             return None
             
         return _call_openai_api(prompt, api_key, model_name, operation_name)
+    elif provider == "lm_studio":
+        api_url = st.session_state.get("lm_studio_api_url", DEFAULT_LM_STUDIO_API_URL)
+        model_name = st.session_state.get("lm_studio_model", DEFAULT_LM_STUDIO_MODEL)
+        
+        return _call_lm_studio_api(prompt, api_url, model_name, operation_name)
     else: # Default to Ollama
         api_url = st.session_state.get("ollama_api_url", DEFAULT_LLM_API_URL)
         model_name = st.session_state.get("ollama_model", DEFAULT_LLM_MODEL)
@@ -124,6 +134,67 @@ def _call_openai_api(prompt: str, api_key: str, model_name: str, operation_name:
         print(f"An error occurred during OpenAI {operation_name}: {e}")
         st.error(f"OpenAI API error: {e} ({operation_name})")
         return None
+
+def _call_lm_studio_api(prompt: str, api_url: str, model_name: str, operation_name: str) -> Optional[str]:
+    """Call the LM Studio API with the given prompt and model."""
+    headers = {"Content-Type": "application/json"}
+    
+    # LM Studio uses OpenAI-compatible format but with messages array
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that provides concise, accurate summaries and follows formatting instructions precisely."
+            },
+            {
+                "role": "user", 
+                "content": prompt
+            }
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1000,
+        "stream": False
+    }
+    
+    try:
+        print(f"Sending request to LM Studio ({model_name}) for {operation_name}...")
+        response = requests.post(api_url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Extract response from the OpenAI-compatible format
+        choices = data.get("choices", [])
+        if choices and len(choices) > 0:
+            llm_response_text = choices[0].get("message", {}).get("content", "").strip()
+        else:
+            llm_response_text = ""
+        
+        # Strip thinking tags from the response
+        llm_response_text = strip_thinking_tags(llm_response_text)
+        
+        if not llm_response_text and prompt:
+            print(f"LM Studio returned an empty response for {operation_name} with a non-empty prompt.")
+        elif llm_response_text:
+            print(f"LM Studio {operation_name} successful.")
+            # Log stats if available
+            stats = data.get("stats", {})
+            if stats:
+                tokens_per_sec = stats.get("tokens_per_second", "N/A")
+                ttft = stats.get("time_to_first_token", "N/A")
+                print(f"  Performance: {tokens_per_sec} tokens/sec, TTFT: {ttft}s")
+                
+        return llm_response_text
+    except requests.exceptions.Timeout:
+        print(f"LM Studio API request timed out during {operation_name}.")
+        st.error(f"LM Studio request timed out. ({operation_name})")
+    except requests.exceptions.RequestException as e:
+        print(f"LM Studio API communication error during {operation_name}: {e}")
+        st.error(f"LM Studio API error: {e} ({operation_name})")
+    except Exception as e:
+        print(f"An unexpected error occurred during LM Studio {operation_name}: {e}")
+        st.error(f"Unexpected LM Studio error: {e} ({operation_name})")
+    return None
 
 def generate_summary_and_category(
     bucket_data: Dict[str, Any], 
@@ -368,6 +439,90 @@ Focus on integrating the user's points accurately.
         return refined_summary, new_category_id, suggested_category, None
 
 
+# Function to get available LM Studio models
+def get_available_lm_studio_models(api_url: str = DEFAULT_LM_STUDIO_API_URL) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Fetch available models from LM Studio API.
+    
+    Args:
+        api_url: The LM Studio API URL (e.g., http://localhost:1234/api/v0/chat/completions)
+        
+    Returns:
+        tuple: (model_names, model_display_info) where:
+            - model_names is a list of model identifiers
+            - model_display_info maps model names to formatted display info
+    """
+    model_names: List[str] = []
+    model_display_info: Dict[str, str] = {}
+    
+    # Extract base URL from chat completions endpoint
+    base_url = api_url.replace('/api/v0/chat/completions', '') if '/api/v0/chat/completions' in api_url else api_url
+    models_url = f"{base_url}/api/v0/models"
+    
+    try:
+        response = requests.get(models_url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            models_data = data.get("data", [])
+            
+            for model_spec in models_data:
+                model_id = model_spec.get("id")
+                if not model_id:
+                    continue
+                    
+                # Skip embedding models
+                model_type = model_spec.get("type", "")
+                if model_type == "embeddings":
+                    continue
+                    
+                # Get model details
+                arch = model_spec.get("arch", "")
+                quant = model_spec.get("quantization", "")
+                state = model_spec.get("state", "")
+                max_context = model_spec.get("max_context_length", 0)
+                
+                model_names.append(model_id)
+                
+                # Build display info
+                display_parts = []
+                if arch:
+                    display_parts.append(arch)
+                if quant:
+                    display_parts.append(f"[{quant}]")
+                if state == "loaded":
+                    display_parts.append("✓ Loaded")
+                if max_context:
+                    display_parts.append(f"({max_context//1024}k ctx)")
+                    
+                if display_parts:
+                    model_display_info[model_id] = " ".join(display_parts)
+                    
+            # Sort models: loaded first, then by name
+            def get_sort_key(model_name: str):
+                # Check if model is loaded by looking for it in the display info
+                is_loaded = "✓ Loaded" in model_display_info.get(model_name, "")
+                return (0 if is_loaded else 1, model_name.lower())
+                
+            model_names.sort(key=get_sort_key)
+            
+            if not model_names:
+                print("No suitable LM Studio models found via API.")
+                return (["granite-3.0-2b-instruct"], {"granite-3.0-2b-instruct": ""})
+                
+            return model_names, model_display_info
+        else:
+            print(f"Error fetching LM Studio models from {models_url}: HTTP {response.status_code}")
+    except requests.exceptions.Timeout:
+        print(f"Timeout connecting to LM Studio API at {models_url}")
+    except requests.exceptions.ConnectionError:
+        print(f"Connection error to LM Studio API at {models_url}. Is LM Studio server running?")
+    except Exception as e:
+        print(f"Error connecting to LM Studio API or parsing models: {e}")
+        
+    # Fallback to a default model if API fails
+    print("Falling back to default LM Studio model.")
+    return (["granite-3.0-2b-instruct"], {"granite-3.0-2b-instruct": ""})
+
 # Function to get available OpenAI models (list of common ones)
 def get_available_openai_models() -> List[str]:
     """Return a list of commonly used OpenAI models, can be expanded."""
@@ -498,6 +653,30 @@ def test_llm_connection() -> Tuple[bool, str]:
                 return False, f"Failed to get a valid response from OpenAI. Got: '{str(response)[:50]}...'"
         except Exception as e: # Catching broad exception from _call_openai_api if it raises
             return False, f"OpenAI API error: {str(e)[:100]}" # str(e) in case e is not a string
+    elif provider == "lm_studio":
+        api_url = st.session_state.get("lm_studio_api_url", DEFAULT_LM_STUDIO_API_URL)
+        model_name = st.session_state.get("lm_studio_model", DEFAULT_LM_STUDIO_MODEL)
+        
+        try:
+            # First, try to list models as a basic connectivity check
+            base_url = api_url.replace('/api/v0/chat/completions', '') if '/api/v0/chat/completions' in api_url else api_url
+            models_check_url = f"{base_url}/api/v0/models"
+            models_response = requests.get(models_check_url, timeout=3)
+            if models_response.status_code != 200:
+                return False, f"LM Studio API error at {models_check_url} (status {models_response.status_code}). Is LM Studio server running?"
+                
+            # Test generation with the selected model
+            response = _call_lm_studio_api(test_prompt, api_url, model_name, "connection test")
+            if response and "connect" in response.lower():
+                return True, f"Connected to LM Studio ({model_name})"
+            else:
+                # Check if model exists
+                available_models, _ = get_available_lm_studio_models(api_url)
+                if model_name not in available_models:
+                    return False, f"LM Studio model '{model_name}' not found. Available: {available_models[:3]}..."
+                return False, f"Failed to get a valid response from LM Studio ({model_name}). Got: '{str(response)[:50]}...'"
+        except Exception as e:
+            return False, f"LM Studio API error: {str(e)[:100]}"
     else: # Ollama
         api_url = st.session_state.get("ollama_api_url", DEFAULT_LLM_API_URL)
         model_name = st.session_state.get("ollama_model", DEFAULT_LLM_MODEL)

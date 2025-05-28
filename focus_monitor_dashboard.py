@@ -28,7 +28,7 @@ from dashboard.data_utils import (
 )
 from dashboard.llm_utils import (
     _call_llm_api, generate_summary_and_category, generate_summary_from_raw_with_llm,
-    refine_summary_with_llm, get_available_ollama_models, 
+    refine_summary_with_llm, get_available_ollama_models, get_available_lm_studio_models,
     get_available_openai_models, test_llm_connection, DEFAULT_LLM_API_URL, DEFAULT_LLM_MODEL, 
     DEFAULT_OPENAI_MODEL, get_openai_models_from_api
 ) # Removed process_activity_data import
@@ -965,6 +965,145 @@ def display_time_bucket_summaries():
 
     st.subheader("📊 5-Minute Activity Buckets (Non-Browser-Profile Activities)")
     st.caption(f"Found {len(official_buckets)} five-minute blocks containing regular activities")
+    
+    # Time range slider for filtering and bulk actions
+    if official_buckets:
+        st.subheader("🕐 Time Range Selection")
+        
+        # Get time range from buckets
+        start_times = [pd.to_datetime(b["start"], utc=True) for b in official_buckets]
+        end_times = [pd.to_datetime(b["end"], utc=True) for b in official_buckets]
+        
+        min_time = min(start_times)
+        max_time = max(end_times)
+        
+        # Create time slider
+        col1, col2 = st.columns(2)
+        with col1:
+            start_time = st.time_input(
+                "Start Time",
+                value=min_time.time(),
+                key="time_range_start"
+            )
+        with col2:
+            end_time = st.time_input(
+                "End Time", 
+                value=max_time.time(),
+                key="time_range_end"
+            )
+        
+        # Combine date with selected times and handle time ordering
+        selected_start = pd.Timestamp.combine(min_time.date(), start_time).tz_localize('UTC')
+        selected_end = pd.Timestamp.combine(min_time.date(), end_time).tz_localize('UTC')
+        
+        # Swap if end time is before start time
+        if selected_end < selected_start:
+            selected_start, selected_end = selected_end, selected_start
+            st.warning("⚠️ End time was before start time - times have been swapped")
+        
+        # Filter buckets by time range
+        buckets_in_range = [
+            b for b in official_buckets 
+            if pd.to_datetime(b["start"], utc=True) >= selected_start 
+            and pd.to_datetime(b["end"], utc=True) <= selected_end
+        ]
+        
+        st.info(f"📊 {len(buckets_in_range)} buckets in selected time range")
+        
+        # Bulk categorization for time range
+        if buckets_in_range and categories:
+            st.subheader("🎯 Bulk Actions for Time Range")
+            
+            col1, col2, col3 = st.columns([2, 2, 1])
+            with col1:
+                bulk_cat_names = ["Select category..."] + [c.get("name") for c in categories]
+                bulk_cat_ids = [""] + [c.get("id") for c in categories]
+                bulk_cat_selection = st.selectbox(
+                    "Set all buckets in range to category:",
+                    bulk_cat_names,
+                    key="bulk_cat_select"
+                )
+            
+            with col2:
+                if bulk_cat_selection != "Select category...":
+                    selected_cat_id = bulk_cat_ids[bulk_cat_names.index(bulk_cat_selection)]
+                    if st.button("🎯 Apply to Time Range", key="bulk_cat_apply"):
+                        success_count = 0
+                        with st.spinner(f"Updating {len(buckets_in_range)} buckets..."):
+                            for bucket in buckets_in_range:
+                                if update_bucket_category_in_file(
+                                    bucket.get("session_tag", "unknown_session"),
+                                    bucket["start"],
+                                    selected_cat_id
+                                ):
+                                    success_count += 1
+                        
+                        st.success(f"✅ Updated {success_count} buckets to '{bulk_cat_selection}'")
+                        time.sleep(1)
+                        st.rerun()
+            
+            with col3:
+                # Generate summary for time range
+                if st.button("📝 Summarize Range", key="summarize_range"):
+                    with st.spinner("Generating summary for time range..."):
+                        # Collect all activities in range
+                        all_titles = []
+                        all_ocr = []
+                        for bucket in buckets_in_range:
+                            all_titles.extend(bucket.get("titles", []))
+                            all_ocr.extend(bucket.get("ocr_text", []))
+                        
+                        # Generate summary
+                        summary_text, suggested_cat_id, _, _ = generate_summary_from_raw_with_llm(
+                            all_titles, all_ocr, False
+                        )
+                        
+                        if summary_text:
+                            st.success("Summary generated!")
+                            st.markdown("**Time Range Summary:**")
+                            st.write(summary_text)
+                            if suggested_cat_id and suggested_cat_id in [c.get("id") for c in categories]:
+                                cat_name = next((c.get("name") for c in categories if c.get("id") == suggested_cat_id), "Unknown")
+                                st.info(f"Suggested category: {cat_name}")
+                        else:
+                            st.error("Failed to generate summary")
+        
+        # Categorize all uncategorized button
+        uncategorized_buckets = [b for b in official_buckets if not b.get("category_id")]
+        if uncategorized_buckets:
+            st.markdown("---")
+            if st.button(f"🤖 Categorize All Uncategorized ({len(uncategorized_buckets)} buckets)", 
+                        key="categorize_all_uncategorized"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                success_count = 0
+                
+                for i, bucket in enumerate(uncategorized_buckets):
+                    status_text.text(f"Processing bucket {i+1}/{len(uncategorized_buckets)}...")
+                    progress_bar.progress((i + 1) / len(uncategorized_buckets))
+                    
+                    # Generate category using LLM
+                    _, category_id, _, _ = generate_summary_from_raw_with_llm(
+                        bucket.get("titles", []),
+                        bucket.get("ocr_text", []),
+                        False  # Don't allow new category suggestions for bulk
+                    )
+                    
+                    if category_id:
+                        if update_bucket_category_in_file(
+                            bucket.get("session_tag", "unknown_session"),
+                            bucket["start"],
+                            category_id
+                        ):
+                            success_count += 1
+                
+                progress_bar.empty()
+                status_text.empty()
+                st.success(f"✅ Categorized {success_count} out of {len(uncategorized_buckets)} buckets")
+                time.sleep(1)
+                st.rerun()
+        
+        st.markdown("---")
 
     show_uncategorized_only = st.checkbox("Filter: Show only uncategorized entries", False)
     
@@ -1938,12 +2077,20 @@ def display_control_panel():
         st.session_state.ollama_model_display_info = {}
     
     # LLM provider selection
-    provider_options = ["ollama", "openai"]
+    provider_options = ["ollama", "openai", "lm_studio"]
+    # Safe index lookup with fallback
+    try:
+        current_index = provider_options.index(st.session_state.llm_provider)
+    except ValueError:
+        # If current provider not in options, default to ollama
+        st.session_state.llm_provider = "ollama"
+        current_index = 0
+        
     selected_provider = st.sidebar.radio(
         "Select LLM Provider", 
         provider_options,
-        index=provider_options.index(st.session_state.llm_provider),
-        help="Choose between local Ollama models or OpenAI API",
+        index=current_index,
+        help="Choose between local Ollama models, OpenAI API, or LM Studio",
         horizontal=True
     )
     
@@ -2028,7 +2175,7 @@ def display_control_panel():
                 st.sidebar.success(f"Found {len(model_names)} available Ollama models")
                 st.rerun()
             
-    else:
+    elif selected_provider == "openai":
         # OpenAI settings
         openai_api_key = st.sidebar.text_input(
             "OpenAI API Key",
@@ -2093,6 +2240,89 @@ def display_control_panel():
             
         # Warning about costs
         st.sidebar.warning("⚠️ Using OpenAI models will incur API costs based on your usage.")
+    
+    else:  # LM Studio
+        # Initialize LM Studio session state
+        if "lm_studio_api_url" not in st.session_state:
+            from dashboard.llm_utils import DEFAULT_LM_STUDIO_API_URL
+            st.session_state.lm_studio_api_url = DEFAULT_LM_STUDIO_API_URL
+        if "lm_studio_model" not in st.session_state:
+            from dashboard.llm_utils import DEFAULT_LM_STUDIO_MODEL
+            st.session_state.lm_studio_model = DEFAULT_LM_STUDIO_MODEL
+        if "lm_studio_models_fetched" not in st.session_state:
+            st.session_state.lm_studio_models_fetched = False
+        if "available_lm_studio_models" not in st.session_state:
+            st.session_state.available_lm_studio_models = []
+        if "lm_studio_model_display_info" not in st.session_state:
+            st.session_state.lm_studio_model_display_info = {}
+            
+        # LM Studio settings
+        lm_studio_api_url = st.sidebar.text_input(
+            "LM Studio API URL",
+            value=st.session_state.lm_studio_api_url,
+            help="URL of the LM Studio API server (default: http://localhost:1234/api/v0/chat/completions)"
+        )
+        
+        # Update API URL in session state if changed
+        api_url_changed = False
+        if lm_studio_api_url != st.session_state.lm_studio_api_url:
+            st.session_state.lm_studio_api_url = lm_studio_api_url
+            api_url_changed = True
+            st.session_state.lm_studio_models_fetched = False
+            
+        # Fetch models if not fetched yet or URL changed
+        if not st.session_state.lm_studio_models_fetched or api_url_changed:
+            with st.sidebar.status("Fetching LM Studio models..."):
+                model_names, model_display_info = get_available_lm_studio_models(lm_studio_api_url)
+                st.session_state.available_lm_studio_models = model_names
+                st.session_state.lm_studio_model_display_info = model_display_info
+                st.session_state.lm_studio_models_fetched = True
+                
+            # Set default model if current one isn't available
+            if (st.session_state.lm_studio_model not in model_names and model_names):
+                st.session_state.lm_studio_model = model_names[0]
+                
+        # Model selection with format display names
+        if st.session_state.available_lm_studio_models:
+            # Create formatted model display names
+            format_model_name = lambda model: (
+                f"{model} - {st.session_state.lm_studio_model_display_info[model]}" 
+                if model in st.session_state.lm_studio_model_display_info 
+                else model
+            )
+            
+            display_models = [format_model_name(m) for m in st.session_state.available_lm_studio_models]
+            
+            # Model selection
+            selected_display = st.sidebar.selectbox(
+                "LM Studio Model",
+                options=display_models,
+                index=0 if st.session_state.lm_studio_model not in st.session_state.available_lm_studio_models else st.session_state.available_lm_studio_models.index(st.session_state.lm_studio_model),
+                help="Select a model loaded in LM Studio"
+            )
+            
+            # Extract actual model name from display
+            selected_idx = display_models.index(selected_display)
+            selected_model = st.session_state.available_lm_studio_models[selected_idx]
+            
+            # Update session state
+            if selected_model != st.session_state.lm_studio_model:
+                st.session_state.lm_studio_model = selected_model
+        else:
+            st.sidebar.warning("No models found. Make sure LM Studio server is running.")
+            
+        # Button to manually refresh models
+        if st.sidebar.button("Refresh LM Studio Models"):
+            with st.sidebar.status("Refreshing models..."):
+                model_names, model_display_info = get_available_lm_studio_models(lm_studio_api_url)
+                st.session_state.available_lm_studio_models = model_names
+                st.session_state.lm_studio_model_display_info = model_display_info
+                st.session_state.lm_studio_models_fetched = True
+                st.sidebar.success(f"Found {len(model_names)} available LM Studio models")
+                st.rerun()
+                
+        # Info about LM Studio
+        st.sidebar.info("💡 LM Studio provides fast local inference with enhanced stats like tokens/sec")
     
     # Test LLM connection
     if st.sidebar.button("Test LLM Connection"):
